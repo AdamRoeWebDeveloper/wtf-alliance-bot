@@ -1,0 +1,18 @@
+{
+  "name": "lap-alliance-bot",
+  "version": "1.0.0",
+  "description": "Last Asylum Plague alliance bot - SB Survival Battle & Alliance Duel reminders",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
