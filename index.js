@@ -256,10 +256,10 @@ async function handleCheeseCommand(message) {
 
 // ---------------------------------------------------------------------------
 // SB SURVIVAL BATTLE
-// 7-day event, starts Friday 03:00 SERVER TIME, repeats weekly.
+// 7-day event, starts Friday 00:00 SERVER TIME, repeats weekly.
 // Fixed lookup table (NOT a formula - Day 4 restarts Day 2's pattern,
 // Day 5 restarts Day 3's pattern, per confirmed screenshots).
-// Slots each day: 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 SERVER TIME
+// Slots each day: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 SERVER TIME
 // ---------------------------------------------------------------------------
 const SB_SCHEDULE = {
   1: ['Enhance Raven', 'Enhance Heroes', 'Build Territory', 'Train Soldiers', 'Technology Research', 'Enhance Raven'],
@@ -271,7 +271,12 @@ const SB_SCHEDULE = {
   7: ['Technology Research', 'Enhance Raven', 'Enhance Heroes', 'Build Territory', 'Train Soldiers', 'Technology Research'],
 };
 
-const SB_SLOT_HOURS = [3, 7, 11, 15, 19, 23];
+// CORRECTED: the original screenshots these were sourced from displayed
+// times in BST (UK local, UTC+1), not true server time. Since server = UTC-2
+// and BST = UTC+1 (a 3-hour gap), the true server-time slots are 3 hours
+// earlier than originally coded. Confirmed via a real CDT member report
+// (expected 21:00 CDT for the first slot, which this correction produces).
+const SB_SLOT_HOURS = [0, 4, 8, 12, 16, 20];
 
 // How each SB activity scores points (confirmed values; TBC = not yet confirmed)
 const SB_SCORING = {
@@ -284,7 +289,7 @@ const SB_SCORING = {
 
 // ---------------------------------------------------------------------------
 // ALLIANCE DUEL (AD)
-// 6-day event, Monday-Saturday, starts 03:00 SERVER TIME Monday, no event Sunday.
+// 6-day event, Monday-Saturday, starts 00:00 SERVER TIME Monday, no event Sunday.
 // ---------------------------------------------------------------------------
 const AD_SCHEDULE = {
   1: {
@@ -300,7 +305,7 @@ const AD_SCHEDULE = {
     ],
     tip: 'Send gatherers out right after reset - queued/in-transit gathering still counts.',
     holdForCrossover: [
-      { action: 'Level up Heroes using Antitoxin', hours: [3, 23], sbActivity: 'Enhance Heroes' },
+      { action: 'Level up Heroes using Antitoxin', hours: [0, 20], sbActivity: 'Enhance Heroes' },
     ],
     unconfirmedCrossover: ['Complete Falcon Quest', 'Consume 1 Raven Essence'],
     noCrossover: ['Consume 1 Stamina', 'Gather Grain/Timber/Herbs', 'Consume 1 Raven Fruit'],
@@ -316,8 +321,8 @@ const AD_SCHEDULE = {
     ],
     tip: 'UR Covert Ops and UR Caravans are worth far more than routine actions - save these if you can control timing.',
     holdForCrossover: [
-      { action: 'Use 1m Construction Speedup', hours: [3, 23], sbActivity: 'Build Territory' },
-      { action: 'Increase 1 Building Might', hours: [3, 23], sbActivity: 'Build Territory' },
+      { action: 'Use 1m Construction Speedup', hours: [0, 20], sbActivity: 'Build Territory' },
+      { action: 'Increase 1 Building Might', hours: [0, 20], sbActivity: 'Build Territory' },
     ],
     unconfirmedCrossover: [],
     noCrossover: ['Execute 1 UR Covert Operation', 'Dispatch a UR Caravan', 'Recruit survivor'],
@@ -333,8 +338,8 @@ const AD_SCHEDULE = {
     ],
     tip: 'Higher-level Raven Gear Chests are worth exponentially more - save chest openings for today if possible.',
     holdForCrossover: [
-      { action: 'Use 1m Research Speedup', hours: [7], sbActivity: 'Technology Research' },
-      { action: 'Increase 1 Tech Might', hours: [7], sbActivity: 'Technology Research' },
+      { action: 'Use 1m Research Speedup', hours: [4], sbActivity: 'Technology Research' },
+      { action: 'Increase 1 Tech Might', hours: [4], sbActivity: 'Technology Research' },
     ],
     unconfirmedCrossover: ['Complete Falcon Quest', 'Consume 1 Study Scroll'],
     noCrossover: ['Raven Gear Chest openings (any level)'],
@@ -351,8 +356,8 @@ const AD_SCHEDULE = {
     ],
     tip: 'Save Hero Shard consumption for today - it does not cross over with SB, but it is a big chunk of AD points.',
     holdForCrossover: [
-      { action: 'Level up Heroes using Antitoxin', hours: [11], sbActivity: 'Enhance Heroes' },
-      { action: 'Recruit heroes', hours: [11], sbActivity: 'Enhance Heroes' },
+      { action: 'Level up Heroes using Antitoxin', hours: [8], sbActivity: 'Enhance Heroes' },
+      { action: 'Recruit heroes', hours: [8], sbActivity: 'Enhance Heroes' },
     ],
     unconfirmedCrossover: [],
     noCrossover: ['Consume UR/SSR/SR Hero Shard', 'Use 1 Skill Badge'],
@@ -367,9 +372,9 @@ const AD_SCHEDULE = {
     ],
     tip: 'Training higher-level soldiers scores significantly more - queue your best-value training today.',
     holdForCrossover: [
-      { action: 'Use 1m Construction Speedup / Increase Building Might', hours: [11], sbActivity: 'Build Territory' },
-      { action: 'Use 1m Training Boost / Train soldiers', hours: [15], sbActivity: 'Train Soldiers' },
-      { action: 'Use 1m Research Speedup / Increase Tech Might', hours: [19], sbActivity: 'Technology Research' },
+      { action: 'Use 1m Construction Speedup / Increase Building Might', hours: [8], sbActivity: 'Build Territory' },
+      { action: 'Use 1m Training Boost / Train soldiers', hours: [12], sbActivity: 'Train Soldiers' },
+      { action: 'Use 1m Research Speedup / Increase Tech Might', hours: [16], sbActivity: 'Technology Research' },
     ],
     unconfirmedCrossover: ['Complete Falcon Quest'],
     noCrossover: [],
@@ -386,9 +391,9 @@ const AD_SCHEDULE = {
     ],
     tip: 'War day - defeating in a targeted alliance match scores far more per kill than general combat.',
     holdForCrossover: [
-      { action: 'Use 1m Construction Speedup', hours: [7], sbActivity: 'Build Territory' },
-      { action: 'Use 1m Training Boost', hours: [11], sbActivity: 'Train Soldiers' },
-      { action: 'Use 1m Research Speedup', hours: [15], sbActivity: 'Technology Research' },
+      { action: 'Use 1m Construction Speedup', hours: [4], sbActivity: 'Build Territory' },
+      { action: 'Use 1m Training Boost', hours: [8], sbActivity: 'Train Soldiers' },
+      { action: 'Use 1m Research Speedup', hours: [12], sbActivity: 'Technology Research' },
     ],
     unconfirmedCrossover: [],
     noCrossover: ['Execute 1 UR Covert Operation', 'Dispatch a UR Caravan', 'Use 1m Healing Speedup', 'Combat (defeated/lost)'],
@@ -650,13 +655,15 @@ client.on('messageCreate', async (message) => {
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  const sbUTCHours = SB_SLOT_HOURS.map(serverHourToUTCHour); // e.g. [6,10,14,18,22,2]
-  const resetUTCHour = serverHourToUTCHour(3); // AD + leader summary both fire at server 03:00
+  const sbUTCHours = SB_SLOT_HOURS.map(serverHourToUTCHour); // e.g. [2,6,10,14,18,22]
+  // CORRECTED: "03:00" was also a mislabeled BST reading, like SB was - true
+  // server-time reset is 3 hours earlier, at 00:00 server time.
+  const resetUTCHour = serverHourToUTCHour(0); // AD + leader summary both fire at server 00:00
 
   // SB: every 4 hours, at the real UTC instants matching server-time slots
   cron.schedule(`0 ${sbUTCHours.join(',')} * * *`, postSBReminder, { timezone: 'Etc/UTC' });
 
-  // AD: once daily at server-time 03:00 (skips itself internally on Sundays)
+  // AD: once daily at server-time 00:00 (skips itself internally on Sundays)
   cron.schedule(`0 ${resetUTCHour} * * *`, postADReminder, { timezone: 'Etc/UTC' });
 
   // Leaders channel: copy-paste summary, once daily alongside AD
@@ -665,7 +672,7 @@ client.once('ready', () => {
   // Cheese events: checked every minute since custom times can have any minute value
   cron.schedule('* * * * *', checkCheeseTimers, { timezone: 'Etc/UTC' });
 
-  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 03:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time).`);
+  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 00:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time).`);
 });
 
 client.login(TOKEN);
