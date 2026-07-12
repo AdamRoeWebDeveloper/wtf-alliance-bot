@@ -101,18 +101,33 @@ function formatRealInstantInZone(date, zoneUTCOffsetHours) {
 
 // ---------------------------------------------------------------------------
 // CHEESE EVENTS
-// Two rallying events, every day, at fixed default server times (Cheese 1 =
-// 16:00, Cheese 2 = 22:00). Leaders can change either time with
-// "!cheese 1 07:00" - once changed, it keeps running at the NEW time every
-// day going forward, until a leader changes it again (or resets it back to
-// default). In-memory only - a bot restart reverts both back to their
-// hard-coded defaults below.
+// Two rallying events, every OTHER day (not daily), at fixed default server
+// times (Cheese 1 = 16:00, Cheese 2 = 22:00). Because the cycle is every 2
+// days and a week has 7 (odd), the actual weekday it lands on drifts forward
+// each cycle rather than staying locked to the same weekday.
+//
+// The cycle is anchored to a fixed start date (CHEESE_ANCHOR_DATE) - active
+// days are that date, +2 days, +4 days, etc. This anchor must stay fixed
+// across restarts (recomputing "start from tomorrow" on every boot would
+// shift the whole cycle), so it's a hard-coded date, not calculated live.
+//
+// Leaders can change either time with "!cheese 1 07:00" - this changes the
+// TIME only, not the every-other-day cadence. Once changed, the new time
+// keeps running on the same active-day pattern until changed again (or reset
+// back to default). In-memory only - a bot restart reverts custom times back
+// to their hard-coded defaults below (the anchor date itself is a constant,
+// so the day pattern survives a restart even though custom times don't).
 // ---------------------------------------------------------------------------
 const CHEESE_DEFAULTS = { 1: { hour: 16, minute: 0 }, 2: { hour: 22, minute: 0 } };
 const cheeseSchedule = { 1: { ...CHEESE_DEFAULTS[1] }, 2: { ...CHEESE_DEFAULTS[2] } };
 
+// First active day of the every-other-day cycle (server-time date). Confirmed
+// as "starting tomorrow" relative to when this rule was set (2026-07-12
+// server time), so tomorrow = 2026-07-13.
+const CHEESE_ANCHOR_DATE = '2026-07-13';
+
 // Tracks the server-time date (YYYY-MM-DD) each phase last fired for each
-// event, so each daily occurrence only triggers its reminders once.
+// event, so each occurrence only triggers its reminders once.
 const cheeseNotified = {
   1: { oneHour: null, tenMin: null, start: null },
   2: { oneHour: null, tenMin: null, start: null },
@@ -120,16 +135,35 @@ const cheeseNotified = {
 
 const CHEESE_RALLY_RULE = "Only launch **1 rally** - do not join others' rallies. This lets offline members get rewards too.";
 
-// Server-time calendar date as a plain string, for "has this fired today yet".
+// Server-time calendar date as a plain string, for "has this fired today yet"
+// and for the every-other-day anchor comparison.
 function serverDateString(realDate) {
   const s = toServerTime(realDate);
   const pad = (n) => String(n).padStart(2, '0');
   return `${s.getUTCFullYear()}-${pad(s.getUTCMonth() + 1)}-${pad(s.getUTCDate())}`;
 }
 
-// Today's occurrence (in real UTC) of a given server-time hour/minute. Used
-// fresh every tick - no rollover needed since "today" naturally advances.
-function getTodaysRealTarget(hour, minute, realNow) {
+// Integer number of whole days between two YYYY-MM-DD date strings (b - a).
+function daysBetweenDateStrings(aStr, bStr) {
+  const a = new Date(aStr + 'T00:00:00Z');
+  const b = new Date(bStr + 'T00:00:00Z');
+  return Math.round((b.getTime() - a.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+// Is the given server-time date string an active Cheese Event day? Active
+// days are the anchor date, then every 2 days after (and before, so this
+// still works correctly if ever queried for a date prior to the anchor).
+function isCheeseActiveDate(dateStr) {
+  const diff = daysBetweenDateStrings(CHEESE_ANCHOR_DATE, dateStr);
+  return diff >= 0 && diff % 2 === 0;
+}
+
+// Today's occurrence (in real UTC) of a given server-time hour/minute, ONLY
+// if today is an active cheese day - returns null on an off-day. Used fresh
+// every tick - no rollover needed since "today" naturally advances.
+function getTodaysRealTargetIfActive(hour, minute, realNow) {
+  const today = serverDateString(realNow);
+  if (!isCheeseActiveDate(today)) return null;
   const serverNow = toServerTime(realNow);
   const serverTarget = new Date(Date.UTC(
     serverNow.getUTCFullYear(), serverNow.getUTCMonth(), serverNow.getUTCDate(), hour, minute, 0
@@ -137,17 +171,50 @@ function getTodaysRealTarget(hour, minute, realNow) {
   return new Date(serverTarget.getTime() + SERVER_TIME_OFFSET_HOURS * 60 * 60 * 1000);
 }
 
-// Next occurrence (rolls to tomorrow if today's has already passed) - used
-// only for display purposes (!timezone, !cheese status), not for the cron logic.
+// Next occurrence (rolls forward day by day, skipping inactive days, until it
+// lands on an active one) - used only for display purposes (!timezone,
+// !cheese status), not for the cron logic.
 function getNextRealTarget(hour, minute, realNow) {
   const serverNow = toServerTime(realNow);
-  let serverTarget = new Date(Date.UTC(
+  let candidateDate = new Date(Date.UTC(
     serverNow.getUTCFullYear(), serverNow.getUTCMonth(), serverNow.getUTCDate(), hour, minute, 0
   ));
-  if (serverTarget.getTime() <= serverNow.getTime()) {
-    serverTarget = new Date(serverTarget.getTime() + 24 * 60 * 60 * 1000);
+  // If today's time slot already passed, start the search from tomorrow.
+  if (candidateDate.getTime() <= serverNow.getTime()) {
+    candidateDate = new Date(candidateDate.getTime() + 24 * 60 * 60 * 1000);
   }
-  return new Date(serverTarget.getTime() + SERVER_TIME_OFFSET_HOURS * 60 * 60 * 1000);
+  // Walk forward (max 2 iterations needed given a 2-day cycle) until active.
+  for (let i = 0; i < 14; i++) {
+    const dateStr = serverDateString(new Date(candidateDate.getTime() + SERVER_TIME_OFFSET_HOURS * 60 * 60 * 1000));
+    if (isCheeseActiveDate(dateStr)) break;
+    candidateDate = new Date(candidateDate.getTime() + 24 * 60 * 60 * 1000);
+  }
+  return new Date(candidateDate.getTime() + SERVER_TIME_OFFSET_HOURS * 60 * 60 * 1000);
+}
+
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// "2026-07-13" -> "Jul 13"
+function formatDateNice(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+
+// "Today" / "Tomorrow" / "Jul 15" depending how far out the target date is,
+// relative to the given "today" date string.
+function formatRelativeDayLabel(targetDateStr, todayDateStr) {
+  const diff = daysBetweenDateStrings(todayDateStr, targetDateStr);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Tomorrow';
+  return formatDateNice(targetDateStr);
+}
+
+// Total minutes -> "4h 12m" or just "45m" if under an hour.
+function formatDuration(totalMinutes) {
+  if (totalMinutes < 0) totalMinutes = 0;
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
 async function announceCheese(num, phase) {
@@ -168,17 +235,20 @@ async function announceCheese(num, phase) {
   }
 }
 
-// Runs every minute: for each cheese event's configured daily time, checks
-// whether we're in the 1-hour / 10-minute / start window and fires once per
-// day per phase. Range checks (not exact equality) so a missed/delayed tick
-// still catches it on the next run.
+// Runs every minute: for each cheese event's configured time, checks whether
+// today is an active day AND whether we're in the 1-hour / 10-minute / start
+// window, firing once per occurrence per phase. On an inactive day, this does
+// nothing at all for that event. Range checks (not exact equality) so a
+// missed/delayed tick still catches it on the next run.
 async function checkCheeseTimers() {
   const now = new Date();
   const today = serverDateString(now);
 
   for (const num of Object.keys(cheeseSchedule)) {
     const { hour, minute } = cheeseSchedule[num];
-    const target = getTodaysRealTarget(hour, minute, now);
+    const target = getTodaysRealTargetIfActive(hour, minute, now);
+    if (!target) continue; // not an active cheese day - skip entirely
+
     const diffMin = Math.round((target.getTime() - now.getTime()) / 60000);
     const notified = cheeseNotified[num];
 
@@ -209,14 +279,21 @@ async function handleCheeseCommand(message) {
 
   // "!cheese status" is read-only - anyone can check it, no leader permission needed.
   if (/^!cheese\s+status$/i.test(content)) {
+    const now = new Date();
+    const todayStr = serverDateString(now);
+    const todayActive = isCheeseActiveDate(todayStr);
     const lines = Object.keys(cheeseSchedule).map(num => {
       const { hour, minute } = cheeseSchedule[num];
       const isDefault = hour === CHEESE_DEFAULTS[num].hour && minute === CHEESE_DEFAULTS[num].minute;
-      const next = getNextRealTarget(hour, minute, new Date());
-      const minutesLeft = Math.round((next.getTime() - Date.now()) / 60000);
+      const next = getNextRealTarget(hour, minute, now);
+      const nextDateStr = serverDateString(next);
+      const minutesLeft = Math.round((next.getTime() - now.getTime()) / 60000);
       const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-      return `Cheese ${num}: ${timeStr} server time daily${isDefault ? ' (default)' : ' (custom)'} - next in ${minutesLeft} min`;
+      const dayLabel = formatRelativeDayLabel(nextDateStr, todayStr);
+      const dateSuffix = (dayLabel === 'Today' || dayLabel === 'Tomorrow') ? `, ${formatDateNice(nextDateStr)}` : '';
+      return `Cheese ${num}: ${timeStr} server time, every other day${isDefault ? ' (default)' : ' (custom)'}\n  Next: ${dayLabel}${dateSuffix} - in ${formatDuration(minutesLeft)}`;
     });
+    lines.push(`(Today ${todayActive ? 'IS' : 'is NOT'} an active cheese day.)`);
     await message.reply(lines.join('\n'));
     return;
   }
@@ -555,6 +632,18 @@ async function postLeaderSummary() {
     text += `ALLIANCE DUEL: no event today (Sunday).\n`;
   }
 
+  text += `\n`;
+  const todayStr = serverDateString(realNow);
+  if (isCheeseActiveDate(todayStr)) {
+    text += `CHEESE EVENTS - today is an active cheese day:\n`;
+    Object.keys(cheeseSchedule).forEach(num => {
+      const { hour, minute } = cheeseSchedule[num];
+      text += `- Cheese ${num}: ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} server time\n`;
+    });
+  } else {
+    text += `CHEESE EVENTS: none today (runs every other day - not today).\n`;
+  }
+
   // Plain text in a code block - easy to select-all and paste into the game's
   // alliance notice field, which does not render Discord markdown.
   const message = '```\n' + text.trim() + '\n```';
@@ -618,7 +707,7 @@ async function handleTimezoneCommand(message) {
       const { hour, minute } = cheeseSchedule[num];
       const next = getNextRealTarget(hour, minute, realNow);
       const minutesLeft = Math.round((next.getTime() - realNow.getTime()) / 60000);
-      return `Cheese ${num}: ${formatRealInstantInZone(next, zoneOffset)} (in ${minutesLeft} min, daily)`;
+      return `Cheese ${num}: ${formatRealInstantInZone(next, zoneOffset)} (in ${formatDuration(minutesLeft)}, every other day)`;
     })
     .join('\n');
   embed.addFields({ name: '🧀 Cheese Events', value: cheeseText });
