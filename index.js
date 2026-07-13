@@ -425,12 +425,15 @@ const AD_SCHEDULE = {
       'Consume 1 Raven Fruit (+6.4)',
       'Consume 1 Raven Essence (+5,375)',
     ],
-    tip: 'Send gatherers out right after reset - queued/in-transit gathering still counts.',
     holdForCrossover: [
       { action: 'Level up Heroes using Antitoxin', hours: [0, 20], sbActivity: 'Enhance Heroes' },
+      { action: 'Consume 1 Stamina', hours: [16], sbActivity: 'Enhance Raven' },
+      { action: 'Consume 1 Raven Fruit', hours: [16], sbActivity: 'Enhance Raven' },
     ],
-    unconfirmedCrossover: ['Complete Falcon Quest', 'Consume 1 Raven Essence'],
-    noCrossover: ['Consume 1 Stamina', 'Gather Grain/Timber/Herbs', 'Consume 1 Raven Fruit'],
+    unconfirmedCrossover: [],
+    noCrossover: ['Gather Grain/Timber/Herbs', 'Consume 1 Raven Essence'],
+    tip: 'Send gatherers out right after reset - queued/in-transit gathering still counts. ' +
+      'Falcon Quest costs stamina to complete - do it at 16:00 (Enhance Raven) and the stamina spent counts for SB too.',
   },
   2: {
     theme: 'Territory / Covert',
@@ -511,7 +514,8 @@ const AD_SCHEDULE = {
       'Soldiers defeated - general (+5 to +27.5)',
       'Soldiers lost still scores points (+4.3 to +23.6)',
     ],
-    tip: 'War day - defeating in a targeted alliance match scores far more per kill than general combat.',
+    tip: 'War day - defeating in a targeted alliance match scores far more per kill than general combat. ' +
+      'Refresh Covert Operations and Caravans until you get an all-gold result before executing/dispatching - it scores significantly more.',
     holdForCrossover: [
       { action: 'Use 1m Construction Speedup', hours: [4], sbActivity: 'Build Territory' },
       { action: 'Use 1m Training Boost', hours: [8], sbActivity: 'Train Soldiers' },
@@ -669,6 +673,81 @@ async function postADReminder() {
     });
   }
 }
+
+// ---------------------------------------------------------------------------
+// Sunday gather-prep reminder: fires once weekly, ~3 hours before Monday's
+// AD reset (server 00:00), i.e. Sunday 20:00 server time. Reminds members to
+// send gatherers out now (RSS Lv.10 tiles) so they land back right at reset,
+// ready for immediate re-deployment and in-transit points on AD Day 1.
+// ---------------------------------------------------------------------------
+async function postGatherPrepReminder() {
+  const embed = new EmbedBuilder()
+    .setTitle('🌾 Send Gatherers Now - AD Resets in ~4 Hours')
+    .setDescription(
+      'Alliance Duel resets at **00:00 server time** (Monday) - about 4 hours from now.\n\n' +
+      'Send your gatherers out **now** on **RSS Level 10 tiles** so they arrive back right at reset, ' +
+      'ready for immediate re-deployment and bonus in-transit gathering points for AD Day 1.'
+    )
+    .setColor(0x38761d)
+    .setTimestamp(new Date());
+
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  if (channel) {
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.allianceduel.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.allianceduel.id),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shield reminders: a 4-stage countdown to Saturday's 00:00 server reset
+// (start of AD Day 6, "raid day"), pinging the Shield role. Fires on Friday
+// (the day before) at 00:00, then 21:00, 23:00, and 23:45 server time.
+// ---------------------------------------------------------------------------
+const SHIELD_REMINDER_MESSAGES = {
+  dayAhead: {
+    title: '🛡️ Raid Day Tomorrow!',
+    description:
+      'Alliance Duel Day 6 tomorrow is raid day! Please make sure you have a shield ' +
+      'ready and activated before reset at **00:00 server time**. You can get a shield ' +
+      'from the alliance shop.',
+  },
+  threeHours: {
+    title: '🛡️ 3 Hours Until Reset',
+    description: 'Please make sure your shield is active before reset - **3 hours** until reset (00:00 server time).',
+  },
+  oneHour: {
+    title: '🛡️ 1 Hour Until Reset',
+    description:
+      'Please activate your shields now - **1 hour** until reset. If you don\'t have a ' +
+      'shield, you can get one from the alliance shop.',
+  },
+  fifteenMin: {
+    title: '🚨 15 Minutes Until Alliance Duel War!',
+    description: 'Please activate your shields now if you have not done so!',
+  },
+};
+
+async function postShieldReminder(stage) {
+  const info = SHIELD_REMINDER_MESSAGES[stage];
+  const embed = new EmbedBuilder()
+    .setTitle(info.title)
+    .setDescription(info.description)
+    .setColor(0x4a5568)
+    .setTimestamp(new Date());
+
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  if (channel) {
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.shield.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.shield.id),
+    });
+  }
+}
+
 
 async function postLeaderSummary() {
   if (!LEADERS_CHANNEL_ID) return; // feature off if not configured
@@ -1257,7 +1336,21 @@ client.once('ready', () => {
   // Cheese events: checked every minute since custom times can have any minute value
   cron.schedule('* * * * *', checkCheeseTimers, { timezone: 'Etc/UTC' });
 
-  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 00:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time).`);
+  // Gather-prep reminder: once weekly, Sunday 20:00 server time (~4h before
+  // Monday's AD reset). Server 20:00 doesn't cross a UTC day boundary, so
+  // cron's day-of-week (0 = Sunday) lines up directly with no adjustment.
+  const gatherPrepUTCHour = serverHourToUTCHour(20);
+  cron.schedule(`0 ${gatherPrepUTCHour} * * 0`, postGatherPrepReminder, { timezone: 'Etc/UTC' });
+
+  // Shield reminders: 4-stage countdown to Saturday's 00:00 server reset
+  // (start of AD Day 6 "raid day"). The last two triggers cross into
+  // Saturday in real UTC terms, so their cron weekday is 6, not 5.
+  cron.schedule('0 2 * * 5', () => postShieldReminder('dayAhead'), { timezone: 'Etc/UTC' });   // Fri 00:00 server
+  cron.schedule('0 23 * * 5', () => postShieldReminder('threeHours'), { timezone: 'Etc/UTC' }); // Fri 21:00 server
+  cron.schedule('0 1 * * 6', () => postShieldReminder('oneHour'), { timezone: 'Etc/UTC' });      // Fri 23:00 server (rolls to Sat UTC)
+  cron.schedule('45 1 * * 6', () => postShieldReminder('fifteenMin'), { timezone: 'Etc/UTC' });  // Fri 23:45 server (rolls to Sat UTC)
+
+  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 00:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time), gather-prep reminder Sunday 20:00 server time (UTC ${gatherPrepUTCHour}), shield reminders Friday 00:00/21:00/23:00/23:45 server time.`);
 });
 
 client.login(TOKEN);
