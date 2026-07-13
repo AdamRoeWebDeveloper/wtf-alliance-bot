@@ -44,6 +44,16 @@ const QUARANTINE_CHANNEL_ID = process.env.QUARANTINE_CHANNEL_ID;
 const APPLICATIONS_CHANNEL_ID = process.env.APPLICATIONS_CHANNEL_ID;
 const ROLES_CHANNEL_ID = process.env.ROLES_CHANNEL_ID;
 
+// ---------------------------------------------------------------------------
+// GIFT CODE RELAY
+// RAW_GIFT_FEED_CHANNEL_ID is a hidden channel that "Follows" another
+// server's gift-codes announcement channel (Discord's native cross-server
+// follow feature). Whatever lands there gets parsed and reposted, cleaned up
+// and copy-friendly, into GIFT_CODES_CHANNEL_ID.
+// ---------------------------------------------------------------------------
+const RAW_GIFT_FEED_CHANNEL_ID = process.env.RAW_GIFT_FEED_CHANNEL_ID;
+const GIFT_CODES_CHANNEL_ID = process.env.GIFT_CODES_CHANNEL_ID;
+
 const WOLF_EMOJI = '<:emoji_3:1525797281561841664>';
 
 // In-memory guard against duplicate "Request to Join" spam from the same
@@ -1098,6 +1108,51 @@ async function handleClearCommand(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Gift code parsing: expects the code as the first non-empty line, e.g.
+// "26CHOCO\n\nYou can try to use this giftcode..." - validates it looks like
+// a plausible code (alphanumeric, no spaces, 3-20 chars) rather than blindly
+// trusting the first line of any message. Also grabs a FAQ/how-to link if
+// one appears anywhere in the message.
+// ---------------------------------------------------------------------------
+function parseGiftCodeMessage(content) {
+  const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return null;
+
+  const firstLine = lines[0];
+  const codePattern = /^[A-Z0-9]{3,20}$/i;
+  if (!codePattern.test(firstLine)) return null;
+
+  const urlMatch = content.match(/https?:\/\/\S+/);
+  return { code: firstLine.toUpperCase(), link: urlMatch ? urlMatch[0] : null };
+}
+
+async function handleGiftFeedMessage(message) {
+  if (!GIFT_CODES_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(GIFT_CODES_CHANNEL_ID);
+  if (!channel) return;
+
+  const parsed = parseGiftCodeMessage(message.content);
+
+  if (parsed) {
+    const embed = new EmbedBuilder()
+      .setTitle('🎁 New Gift Code!')
+      .setDescription(
+        `Well, he has done it again folks! ALI3N has found yet another winner. 👽\n\n` +
+        `Is there anything this Extraterrestrial cant do? I doubt it! What an absolute legend that space man is. Now go get your rewards! ${WOLF_EMOJI}\n\n` +
+        '```\n' + parsed.code + '\n```' +
+        (parsed.link ? `\nHow to redeem: ${parsed.link}` : '')
+      )
+      .setColor(0xf6ad55)
+      .setTimestamp(new Date());
+    await channel.send({ embeds: [embed] });
+  } else {
+    // Couldn't confidently parse a code - relay as-is rather than guess wrong,
+    // flagged so a leader can check/repost manually if needed.
+    await channel.send(`⚠️ New post detected in the gift code feed but couldn't auto-parse a code - please check manually:\n${message.content}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Button interactions: "Request to Join" (from new members) and the leader
 // approval buttons (Approve as Member / Approve as Allied Wolf / Deny).
 // ---------------------------------------------------------------------------
@@ -1286,6 +1341,18 @@ client.on('interactionCreate', async (interaction) => {
 
 
 client.on('messageCreate', async (message) => {
+  // Cross-server "Follow Channel" messages arrive via webhook and would
+  // otherwise get skipped by the bot-message filter below - handle this one
+  // specific channel first, regardless of author.
+  if (RAW_GIFT_FEED_CHANNEL_ID && message.channel.id === RAW_GIFT_FEED_CHANNEL_ID) {
+    try {
+      await handleGiftFeedMessage(message);
+    } catch (err) {
+      console.error('Error relaying gift code:', err.message);
+    }
+    return;
+  }
+
   if (message.author.bot) return;
   const content = message.content.toLowerCase();
   try {
