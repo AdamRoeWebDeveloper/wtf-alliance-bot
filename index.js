@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const cron = require('node-cron');
 const http = require('http');
 
@@ -27,6 +27,40 @@ const CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;
 const LEADERS_CHANNEL_ID = process.env.LEADERS_CHANNEL_ID || null;
 const LEADER_ROLE_ID = process.env.LEADER_ROLE_ID || null; // if unset, falls back to requiring Administrator permission
 const PING_ROLE_ID = process.env.PING_ROLE_ID || null;
+
+// ---------------------------------------------------------------------------
+// QUARANTINE + JOIN APPROVAL SYSTEM
+// New members are auto-assigned the Quarantine role on join, which (per the
+// channel permission setup) only lets them see quarantine-checkpoint. They
+// click "Request to Join" there, which notifies R4/R5 in the applications
+// channel with three buttons: Approve as Member, Approve as Allied Wolf, Deny.
+// ---------------------------------------------------------------------------
+const QUARANTINE_ROLE_ID = process.env.QUARANTINE_ROLE_ID;
+const ALLIED_WOLF_ROLE_ID = process.env.ALLIED_WOLF_ROLE_ID;
+const R3_ROLE_ID = process.env.R3_ROLE_ID;
+const R4_ROLE_ID = process.env.R4_ROLE_ID;
+const R5_ROLE_ID = process.env.R5_ROLE_ID;
+const QUARANTINE_CHANNEL_ID = process.env.QUARANTINE_CHANNEL_ID;
+const APPLICATIONS_CHANNEL_ID = process.env.APPLICATIONS_CHANNEL_ID;
+const ROLES_CHANNEL_ID = process.env.ROLES_CHANNEL_ID;
+
+const WOLF_EMOJI = '<:emoji_3:1525797281561841664>';
+
+// In-memory guard against duplicate "Request to Join" spam from the same
+// person before their first request has been actioned.
+const pendingJoinRequests = new Set();
+
+// ---------------------------------------------------------------------------
+// SELF-ASSIGNABLE SQUAD ROLES
+// "!role <name>" toggles one of these on/off for whoever runs it.
+// ---------------------------------------------------------------------------
+const SQUAD_ROLES = {
+  cheese: { id: process.env.CHEESE_ROLE_ID, label: 'Cheese' },
+  survivalbattle: { id: process.env.SURVIVAL_BATTLE_ROLE_ID, label: 'Survival Battle' },
+  allianceduel: { id: process.env.ALLIANCE_DUEL_ROLE_ID, label: 'Alliance Duel' },
+  caravan: { id: process.env.CARAVAN_ROLE_ID, label: 'Caravan' },
+  shield: { id: process.env.SHIELD_ROLE_ID, label: 'Shield' },
+};
 
 // ---------------------------------------------------------------------------
 // SERVER TIME
@@ -231,7 +265,11 @@ async function announceCheese(num, phase) {
 
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (channel) {
-    await channel.send({ content: pingPrefix(), embeds: [embed], allowedMentions: { parse: ['everyone', 'roles'] } });
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.cheese.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.cheese.id),
+    });
   }
 }
 
@@ -268,10 +306,17 @@ async function checkCheeseTimers() {
 }
 
 function isLeader(message) {
-  if (LEADER_ROLE_ID) {
-    return message.member && message.member.roles.cache.has(LEADER_ROLE_ID);
+  if (!message.member) return false;
+  // Consistent with the join-approval buttons: R4 or R5 counts as a leader.
+  if (message.member.roles.cache.has(R4_ROLE_ID) || message.member.roles.cache.has(R5_ROLE_ID)) {
+    return true;
   }
-  return message.member && message.member.permissions.has(PermissionsBitField.Flags.Administrator);
+  // Optional extra override role, if you ever want a leader role beyond R4/R5.
+  if (LEADER_ROLE_ID && message.member.roles.cache.has(LEADER_ROLE_ID)) {
+    return true;
+  }
+  // Final fallback for server owners/admins who aren't R4/R5.
+  return message.member.permissions.has(PermissionsBitField.Flags.Administrator);
 }
 
 async function handleCheeseCommand(message) {
@@ -500,9 +545,19 @@ function getADDay(date) {
   return map[getUTCWeekday(date)] || null;
 }
 
-function pingPrefix() {
-  // @everyone on every notification, plus an optional extra role ping if configured.
-  return PING_ROLE_ID ? `@everyone <@&${PING_ROLE_ID}> ` : '@everyone ';
+// Builds a ping string for one or more role IDs, plus the optional extra
+// PING_ROLE_ID if configured. Replaces the old @everyone-for-everything
+// approach - each notification type now only pings the members who opted
+// into that specific squad role.
+function rolePing(...roleIds) {
+  const ids = [...roleIds.filter(Boolean)];
+  if (PING_ROLE_ID) ids.push(PING_ROLE_ID);
+  return ids.map(id => `<@&${id}>`).join(' ');
+}
+function rolePingAllowedMentions(...roleIds) {
+  const ids = [...roleIds.filter(Boolean)];
+  if (PING_ROLE_ID) ids.push(PING_ROLE_ID);
+  return { roles: ids };
 }
 
 async function postSBReminder() {
@@ -525,7 +580,11 @@ async function postSBReminder() {
 
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (channel) {
-    await channel.send({ content: pingPrefix(), embeds: [embed], allowedMentions: { parse: ['everyone', 'roles'] } });
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.survivalbattle.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.survivalbattle.id),
+    });
   }
 
   // Separate, standalone crossover alert - only sent if today's AD day has an
@@ -556,7 +615,11 @@ async function postCrossoverAlert(realNow, now, sbDay, activity, hour) {
 
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (channel) {
-    await channel.send({ content: pingPrefix(), embeds: [embed], allowedMentions: { parse: ['everyone', 'roles'] } });
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.survivalbattle.id, SQUAD_ROLES.allianceduel.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.survivalbattle.id, SQUAD_ROLES.allianceduel.id),
+    });
   }
 }
 
@@ -599,7 +662,11 @@ async function postADReminder() {
 
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (channel) {
-    await channel.send({ content: pingPrefix(), embeds: [embed], allowedMentions: { parse: ['everyone', 'roles'] } });
+    await channel.send({
+      content: rolePing(SQUAD_ROLES.allianceduel.id),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(SQUAD_ROLES.allianceduel.id),
+    });
   }
 }
 
@@ -720,6 +787,411 @@ async function handleTimezoneCommand(message) {
   await message.reply({ embeds: [embed] });
 }
 
+// ---------------------------------------------------------------------------
+// QUARANTINE ON JOIN + PERSONALIZED WELCOME
+// Every new member gets the Quarantine role AND their own personalized
+// welcome message with the Request to Join button, posted automatically -
+// not a single shared/persistent message, a fresh one addressed to them.
+// ---------------------------------------------------------------------------
+function buildWelcomeMessage(member) {
+  const embed = new EmbedBuilder()
+    .setDescription(
+      `**Welcome to the den, ${member}.**\n` +
+      `You've wandered into **[WTF] WAKE THE FERAL**'s territory. ${WOLF_EMOJI}\n\n` +
+      `**How this works:**\n` +
+      `Tap **Request to Join** below\n` +
+      `Our leaders (R4/R5) will review your request as soon as possible.\n\n` +
+      `You'll be let in as either a **Full Member** or an **Allied Wolf** (if you're visiting from an allied KvK alliance).\n\n` +
+      `Sit tight in here until then - the rest of the den opens up once you're approved.`
+    )
+    .setColor(0x2d3748);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('request_join').setLabel('Request to Join').setStyle(ButtonStyle.Success)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+// ---------------------------------------------------------------------------
+// Posted right after someone is approved as a Full Member - lets them opt
+// into notification-role pings for whichever events they actually care about.
+// Buttons toggle on/off, same as "!role", but presented proactively rather
+// than requiring them to already know the command exists.
+// ---------------------------------------------------------------------------
+function buildRoleOptInMessage(member, { isNewApproval = false } = {}) {
+  const intro = isNewApproval
+    ? `Welcome to the pack, ${member}! Pick which event notifications you want to be pinged for below - ` +
+      `you can change these anytime with \`!role <name>\` or \`!notifications\`.`
+    : `${member}, here are your current notification roles - green means ON, red means OFF. Tap any to toggle it.`;
+
+  const embed = new EmbedBuilder()
+    .setTitle('🔔 Notification Roles')
+    .setDescription(intro)
+    .setColor(0x2b6cb0);
+
+  const makeButton = (key) => new ButtonBuilder()
+    .setCustomId(`optin_${key}_${member.id}`)
+    .setLabel(SQUAD_ROLES[key].label)
+    .setStyle(member.roles.cache.has(SQUAD_ROLES[key].id) ? ButtonStyle.Success : ButtonStyle.Danger);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    makeButton('cheese'), makeButton('survivalbattle'), makeButton('allianceduel')
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    makeButton('caravan'), makeButton('shield')
+  );
+
+  return { content: `${member}`, embeds: [embed], components: [row1, row2], allowedMentions: { users: [member.id] } };
+}
+
+
+client.on('guildMemberAdd', async (member) => {
+  try {
+    await member.roles.add(QUARANTINE_ROLE_ID);
+    console.log(`Assigned Quarantine role to new member: ${member.user.tag}`);
+  } catch (err) {
+    console.error(`Failed to assign Quarantine role to ${member.user.tag}:`, err.message);
+  }
+
+  try {
+    const channel = await client.channels.fetch(QUARANTINE_CHANNEL_ID);
+    if (channel) {
+      await channel.send(buildWelcomeMessage(member));
+    }
+  } catch (err) {
+    console.error(`Failed to post welcome message for ${member.user.tag}:`, err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// "!setup-welcome" - now just a leader-only PREVIEW/TEST command, since the
+// real welcome message posts automatically per new member above. Useful for
+// checking how it looks/wording without needing an actual new join.
+// ---------------------------------------------------------------------------
+async function handleSetupWelcomeCommand(message) {
+  if (!isLeader(message)) {
+    await message.reply('Only leaders can run this preview command.');
+    return;
+  }
+
+  const channel = await client.channels.fetch(QUARANTINE_CHANNEL_ID);
+  if (channel) {
+    await channel.send(buildWelcomeMessage(message.member));
+    await message.reply('Preview posted (addressed to you, for testing - real new members get their own automatically).');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "!role <squad>" - toggles a self-assignable squad role on/off for whoever
+// runs it. Anyone can use this (no leader restriction).
+// ---------------------------------------------------------------------------
+async function handleRoleCommand(message) {
+  const parts = message.content.trim().split(/\s+/);
+  const key = (parts[1] || '').toLowerCase().replace(/\s+/g, '');
+
+  if (!key || !SQUAD_ROLES[key]) {
+    const available = [...new Set(Object.values(SQUAD_ROLES).map(r => r.label))].join(', ');
+    await message.reply(`Usage: \`!role <name>\` - available: ${available}`);
+    return;
+  }
+
+  const { id: roleId, label } = SQUAD_ROLES[key];
+  const member = message.member;
+  if (!member) {
+    await message.reply('Could not find your server membership - please try again.');
+    return;
+  }
+
+  try {
+    if (member.roles.cache.has(roleId)) {
+      await member.roles.remove(roleId);
+      await message.reply(`Removed the **${label}** role.`);
+    } else {
+      await member.roles.add(roleId);
+      await message.reply(`Added the **${label}** role.`);
+    }
+  } catch (err) {
+    console.error('Error toggling squad role:', err.message);
+    await message.reply('Something went wrong changing that role - please tell a leader.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "!notifications" - anyone can run this anytime to re-trigger the same
+// button-based opt-in prompt that new members get automatically on approval.
+// Useful for existing members who joined before this feature existed, or
+// anyone who wants to revisit their choices.
+// ---------------------------------------------------------------------------
+async function handleNotificationsCommand(message) {
+  const member = message.member;
+  if (!member) {
+    await message.reply('Could not find your server membership - please try again.');
+    return;
+  }
+  await message.channel.send(buildRoleOptInMessage(member));
+}
+
+// ---------------------------------------------------------------------------
+// PERSISTENT ROLES-CHANNEL PICKER
+// A single static message with generic (not personalized) buttons, meant to
+// live permanently in a channel that has chat disabled (Send Messages denied
+// for @everyone) - buttons work independently of that permission, so this is
+// the only way to let people self-manage roles in a channel with no chat.
+//
+// Buttons here are always neutral color - NOT state-reflecting - because
+// this one message is shared by everyone. If it changed color to match
+// whoever last clicked it, every other viewer would see a state that isn't
+// their own. Each click instead gets its own private (ephemeral) confirmation.
+// ---------------------------------------------------------------------------
+function buildPersistentRolePicker() {
+  const embed = new EmbedBuilder()
+    .setTitle('🔔 Notification Roles')
+    .setDescription(
+      'Tap a button below to toggle that notification role on or off for yourself.\n' +
+      "You'll get a private confirmation each time - the buttons themselves don't change color, " +
+      'since this message is shared by everyone.'
+    )
+    .setColor(0x2b6cb0);
+
+  const makeButton = (key) => new ButtonBuilder()
+    .setCustomId(`pickroles_${key}`)
+    .setLabel(SQUAD_ROLES[key].label)
+    .setStyle(ButtonStyle.Secondary);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    makeButton('cheese'), makeButton('survivalbattle'), makeButton('allianceduel')
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    makeButton('caravan'), makeButton('shield')
+  );
+
+  return { embeds: [embed], components: [row1, row2] };
+}
+
+// "!setup-roles" - leaders run this ONCE to post the persistent picker into
+// the roles channel. Not automatic on every restart, to avoid duplicates.
+async function handleSetupRolesCommand(message) {
+  if (!isLeader(message)) {
+    await message.reply('Only leaders can run this setup command.');
+    return;
+  }
+  if (!ROLES_CHANNEL_ID) {
+    await message.reply('ROLES_CHANNEL_ID is not configured.');
+    return;
+  }
+  const channel = await client.channels.fetch(ROLES_CHANNEL_ID);
+  if (channel) {
+    await channel.send(buildPersistentRolePicker());
+    await message.reply('Roles picker posted.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "!clear <number>" - leader-only bulk delete, e.g. "!clear 20" removes the
+// last 20 messages plus the command itself. Requires the Manage Messages
+// permission (not previously needed by this bot - must be added).
+// Discord only allows bulk-deleting messages younger than 14 days; anything
+// older is silently skipped rather than erroring.
+// ---------------------------------------------------------------------------
+async function handleClearCommand(message) {
+  if (!isLeader(message)) {
+    await message.reply('Only leaders can use this command.');
+    return;
+  }
+
+  const parts = message.content.trim().split(/\s+/);
+  const count = parseInt(parts[1], 10);
+  if (!count || count < 1 || count > 99) {
+    await message.reply('Usage: `!clear <number>` - between 1 and 99.');
+    return;
+  }
+
+  try {
+    // +1 to also remove the "!clear" command message itself.
+    const deleted = await message.channel.bulkDelete(count + 1, true);
+    const confirmMsg = await message.channel.send(`🧹 Cleared ${deleted.size - 1} message(s).`);
+    setTimeout(() => confirmMsg.delete().catch(() => {}), 5000);
+  } catch (err) {
+    console.error('Error clearing messages:', err.message);
+    await message.channel.send('Something went wrong - Discord can only bulk-delete messages younger than 14 days, and the bot needs the Manage Messages permission.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Button interactions: "Request to Join" (from new members) and the leader
+// approval buttons (Approve as Member / Approve as Allied Wolf / Deny).
+// ---------------------------------------------------------------------------
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  try {
+    if (interaction.customId === 'request_join') {
+      const userId = interaction.user.id;
+
+      if (pendingJoinRequests.has(userId)) {
+        await interaction.reply({ content: 'Your request is already pending review - sit tight!', ephemeral: true });
+        return;
+      }
+      pendingJoinRequests.add(userId);
+
+      const embed = new EmbedBuilder()
+        .setTitle('New Join Request!')
+        .setDescription(
+          `${interaction.user} (\`${interaction.user.tag}\`) wants to join the pack.\n\n` +
+          `@R4 / @R5 please reach out if you do not know the player.\n\n` +
+          `[WTF] WAKE THE FERAL ${WOLF_EMOJI}`
+        )
+        .addFields({ name: 'Account created', value: `<t:${Math.floor(interaction.user.createdTimestamp / 1000)}:R>` })
+        .setColor(0xd69e2e)
+        .setTimestamp(new Date());
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`approve_member_${userId}`).setLabel('Approve as Member').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`approve_guest_${userId}`).setLabel('Approve as Allied Wolf').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`deny_${userId}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
+      );
+
+      const appChannel = await client.channels.fetch(APPLICATIONS_CHANNEL_ID);
+      if (appChannel) {
+        await appChannel.send({
+          content: `<@&${R4_ROLE_ID}> <@&${R5_ROLE_ID}>`,
+          embeds: [embed],
+          components: [row],
+          allowedMentions: { roles: [R4_ROLE_ID, R5_ROLE_ID] },
+        });
+      }
+
+      await interaction.reply({ content: 'Your request has been sent to the leaders for review. Sit tight!', ephemeral: true });
+      return;
+    }
+
+    const approveMemberMatch = interaction.customId.match(/^approve_member_(\d+)$/);
+    const approveGuestMatch = interaction.customId.match(/^approve_guest_(\d+)$/);
+    const denyMatch = interaction.customId.match(/^deny_(\d+)$/);
+
+    if (approveMemberMatch || approveGuestMatch || denyMatch) {
+      const isApprover = interaction.member.roles.cache.has(R4_ROLE_ID) || interaction.member.roles.cache.has(R5_ROLE_ID);
+      if (!isApprover) {
+        await interaction.reply({ content: 'Only R4/R5 can action join requests.', ephemeral: true });
+        return;
+      }
+
+      const targetUserId = (approveMemberMatch || approveGuestMatch || denyMatch)[1];
+      const guild = interaction.guild;
+      let targetMember;
+      try {
+        targetMember = await guild.members.fetch(targetUserId);
+      } catch {
+        await interaction.reply({ content: 'That member seems to have left the server already.', ephemeral: true });
+        return;
+      }
+
+      let resultText;
+      if (approveMemberMatch) {
+        await targetMember.roles.remove(QUARANTINE_ROLE_ID).catch(() => {});
+        await targetMember.roles.add(R3_ROLE_ID);
+        resultText = `✅ Approved as **Member** (R3) by ${interaction.user}`;
+
+        const mainChannel = await client.channels.fetch(CHANNEL_ID);
+        if (mainChannel) {
+          await mainChannel.send(buildRoleOptInMessage(targetMember, { isNewApproval: true }));
+        }
+      } else if (approveGuestMatch) {
+        await targetMember.roles.remove(QUARANTINE_ROLE_ID).catch(() => {});
+        await targetMember.roles.add(ALLIED_WOLF_ROLE_ID);
+        resultText = `✅ Approved as **Allied Wolf** by ${interaction.user}`;
+      } else {
+        // Deny: leave them in Quarantine, don't kick - just notify.
+        resultText = `❌ Denied by ${interaction.user} (left in Quarantine)`;
+        const qChannel = await client.channels.fetch(QUARANTINE_CHANNEL_ID);
+        if (qChannel) {
+          await qChannel.send(`${targetMember} your join request was not approved. Please reach out to a leader.`);
+        }
+      }
+
+      pendingJoinRequests.delete(targetUserId);
+
+      const disabledRow = new ActionRowBuilder().addComponents(
+        ButtonBuilder.from(interaction.message.components[0].components[0]).setDisabled(true),
+        ButtonBuilder.from(interaction.message.components[0].components[1]).setDisabled(true),
+        ButtonBuilder.from(interaction.message.components[0].components[2]).setDisabled(true)
+      );
+
+      const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0]).addFields({ name: 'Outcome', value: resultText });
+
+      await interaction.update({ embeds: [updatedEmbed], components: [disabledRow] });
+      return;
+    }
+
+    const optinMatch = interaction.customId.match(/^optin_([a-z]+)_(\d+)$/);
+    if (optinMatch) {
+      const [, key, ownerId] = optinMatch;
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: "This isn't your prompt - use `!role <name>` to manage your own roles.", ephemeral: true });
+        return;
+      }
+
+      const squad = SQUAD_ROLES[key];
+      if (!squad) return;
+
+      const member = interaction.member;
+      const hasRole = member.roles.cache.has(squad.id);
+      try {
+        const updatedMember = hasRole
+          ? await member.roles.remove(squad.id)
+          : await member.roles.add(squad.id);
+
+        // Rebuild using the member object RETURNED by add/remove (guaranteed
+        // fresh role cache) rather than the original reference, then update
+        // the message in place with the new button colors.
+        const refreshed = buildRoleOptInMessage(updatedMember);
+        await interaction.update({ embeds: refreshed.embeds, components: refreshed.components });
+        await interaction.followUp({
+          content: hasRole ? `Removed the **${squad.label}** role.` : `Added the **${squad.label}** role.`,
+          ephemeral: true,
+        });
+      } catch (err) {
+        console.error('Error toggling opt-in role:', err.message);
+        await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
+      }
+      return;
+    }
+
+    const pickMatch = interaction.customId.match(/^pickroles_([a-z]+)$/);
+    if (pickMatch) {
+      const key = pickMatch[1];
+      const squad = SQUAD_ROLES[key];
+      if (!squad) return;
+
+      const member = interaction.member;
+      const hasRole = member.roles.cache.has(squad.id);
+      try {
+        if (hasRole) {
+          await member.roles.remove(squad.id);
+        } else {
+          await member.roles.add(squad.id);
+        }
+        // No interaction.update() here - the message is shared by everyone,
+        // so it stays exactly as-is. Only the clicking person gets feedback.
+        await interaction.reply({
+          content: hasRole ? `Removed the **${squad.label}** role.` : `Added the **${squad.label}** role.`,
+          ephemeral: true,
+        });
+      } catch (err) {
+        console.error('Error toggling pickroles role:', err.message);
+        await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error('Error handling button interaction:', err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
+    }
+  }
+});
+
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   const content = message.content.toLowerCase();
@@ -728,6 +1200,16 @@ client.on('messageCreate', async (message) => {
       await handleTimezoneCommand(message);
     } else if (content.startsWith('!cheese')) {
       await handleCheeseCommand(message);
+    } else if (content.startsWith('!setup-welcome')) {
+      await handleSetupWelcomeCommand(message);
+    } else if (content.startsWith('!role')) {
+      await handleRoleCommand(message);
+    } else if (content.startsWith('!notifications')) {
+      await handleNotificationsCommand(message);
+    } else if (content.startsWith('!setup-roles')) {
+      await handleSetupRolesCommand(message);
+    } else if (content.startsWith('!clear')) {
+      await handleClearCommand(message);
     }
   } catch (err) {
     console.error('Error handling command:', err);
