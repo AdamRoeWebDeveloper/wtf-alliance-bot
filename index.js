@@ -1029,6 +1029,14 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId === 'request_join') {
       const userId = interaction.user.id;
 
+      // Someone without Quarantine can still SEE this button if they have
+      // Administrator (which bypasses Discord's channel permissions entirely)
+      // - but they shouldn't be able to trigger a real join request.
+      if (!interaction.member.roles.cache.has(QUARANTINE_ROLE_ID)) {
+        await interaction.reply({ content: "You're already part of the alliance - no need to request again!", ephemeral: true });
+        return;
+      }
+
       if (pendingJoinRequests.has(userId)) {
         await interaction.reply({ content: 'Your request is already pending review - sit tight!', ephemeral: true });
         return;
