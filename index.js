@@ -1147,10 +1147,13 @@ client.on('interactionCreate', async (interaction) => {
         // the message in place with the new button colors.
         const refreshed = buildRoleOptInMessage(updatedMember);
         await interaction.update({ embeds: refreshed.embeds, components: refreshed.components });
-        await interaction.followUp({
+        const confirmMsg = await interaction.followUp({
           content: hasRole ? `Removed the **${squad.label}** role.` : `Added the **${squad.label}** role.`,
           ephemeral: true,
         });
+        // followUp messages need their own .delete() (deleteReply() only
+        // targets the original reply) - clean up after a few seconds.
+        setTimeout(() => confirmMsg.delete().catch(() => {}), 3000);
       } catch (err) {
         console.error('Error toggling opt-in role:', err.message);
         await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
@@ -1178,6 +1181,9 @@ client.on('interactionCreate', async (interaction) => {
           content: hasRole ? `Removed the **${squad.label}** role.` : `Added the **${squad.label}** role.`,
           ephemeral: true,
         });
+        // Ephemeral messages don't auto-dismiss on their own - clean it up
+        // after a few seconds so repeated clicks don't pile up in view.
+        setTimeout(() => interaction.deleteReply().catch(() => {}), 3000);
       } catch (err) {
         console.error('Error toggling pickroles role:', err.message);
         await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
