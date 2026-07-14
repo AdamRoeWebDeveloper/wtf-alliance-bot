@@ -54,6 +54,99 @@ const ROLES_CHANNEL_ID = process.env.ROLES_CHANNEL_ID;
 const RAW_GIFT_FEED_CHANNEL_ID = process.env.RAW_GIFT_FEED_CHANNEL_ID;
 const GIFT_CODES_CHANNEL_ID = process.env.GIFT_CODES_CHANNEL_ID;
 
+// ---------------------------------------------------------------------------
+// CARAVAN COACHMAN ROTATION
+// Two independent rosters (12:00 and 00:00 server time slots), each cycling
+// every 2 days. If the SAME person would land both slots on the same day
+// (only possible for whoever is shared between both lists), the 00:00 slot
+// skips ahead to the next person in its own line rather than double-booking
+// them - this is a one-time-per-occurrence skip that then keeps the two
+// rotations naturally out of phase going forward.
+//
+// The anchor date is the last confirmed real assignment (2026-07-30, where
+// 12:00 = Happy and this collision rule was first confirmed to apply).
+// Recomputed fresh from this anchor every time (not stored mutable state),
+// so it's safe across bot restarts.
+// ---------------------------------------------------------------------------
+const CARAVAN_ANCHOR_DATE = '2026-07-30';
+const CARAVAN_AM_ROSTER = [
+  { name: 'lirco', id: '413224675062185984' },
+  { name: 'ALI3N', id: '1426962772260028539' },
+  { name: 'Unity', id: '685176793560383513' },
+  { name: 'Stone', id: '1068251448602800239' },
+  { name: 'Happy', id: '708051517386653698' },
+];
+const CARAVAN_PM_ROSTER = [
+  { name: 'Maxx', id: '296827369136717834' },
+  { name: 'sleepy', id: '253352609383972874' },
+  { name: 'Freya', id: '970847011043688499' },
+  { name: 'Bitz', id: '483794330625114146' },
+  { name: 'Happy', id: '708051517386653698' },
+];
+const CARAVAN_CHANNEL_ID = process.env.CARAVAN_COACHMAN_CHANNEL_ID;
+
+// ---------------------------------------------------------------------------
+// VIP LIST (Caravan)
+// Plain names, not linked to Discord accounts. The coachman on duty (or any
+// R4/R5) picks someone off VIP_REMAINING and marks them with "!vip <name>".
+// Once everyone's had a turn (or a leader wants to restart early), "!reset"
+// refills VIP_REMAINING back to the full VIP_MASTER list. R4/R5 manage list
+// membership itself with "!add"/"!remove" (people join/leave the alliance).
+// All five VIP commands only work inside CARAVAN_CHANNEL_ID.
+//
+// TODO: seed VIP_MASTER with the real initial list - currently empty.
+// ---------------------------------------------------------------------------
+let VIP_MASTER = [
+  'Again2', 'NurseNikki', 'TWISTER', 'BDAalex', 'KirbyMorgan', 'MaryMonsterFairy', 'DinoDingo2b',
+  'MothaCoconuts', 'ArchonTiddles', 'XxLordRahlxX', 'CouryAZ41', 'Ass-Modiel', 'P4nd0ra', 'Karazuko',
+  'Chunnlei', 'Iza1234', 'Kisten', 'QuirkyTurkey13', 'DocOver', 'Kayotic101', 'woody4376',
+  'Indigo-Moon', 'Djmark3696', 'bayram047', 'Cannabinoid', 'Novacaine2', 'DoctorAnteros', 'psychohontas',
+  'MisterCrowley', 'Crappy', 'TankTerror', 'Coldcreature', 'Lukas1983', 'fetih', 'Savage-Kitty',
+  'O-Town', 'Lorita', 'NyxX', 'LordDenning', 'RachelGreen', 'Ame83', 'Moon313', 'MadamDefne', 'Ovais',
+  'Odinark', 'AmethystMoon', 'sleepinginthetub', 'Zoeking', 'Forgottenagain', 'MrMAV', 'RichardCypher',
+  'Amarah302', 'FuadAsyhary', 'Emirefe', 'DrMySs', 'ANGRYkOALA', 'JinCheonhee', 'Fragrance', 'fkIGG',
+  'kanaia', 'Terita', 'About4bees', 'Eleanor238', 'ThalionMora', 'Legionar', 'AG1', 'SoggyKoala',
+  'Phylisha', 'emiilii', 'goddessOFdiscord', 'Pandobrodiy', 'Raco78oner', 'ReqX', 'Angela28', 'D4Della',
+  'Phule-Ripp', 'SassyNat', 'TRex23', 'Darkrasp', 'NOTU', 'Saiyyajin', 'Lizzzardking', 'Daysbright',
+  'Lilithsdottir', 'GR99', 'warameo', 'CapyBear',
+]; // full pool of eligible names (87 - all confirmed alliance members, excluding leadership AND all R4)
+let VIP_REMAINING = [...VIP_MASTER]; // who hasn't been picked yet this cycle
+
+// Destructive actions (!reset, !add, !remove) need a button confirmation
+// before taking effect. Pending ones are tracked here, keyed by a short id.
+const pendingVipActions = new Map();
+let vipActionCounter = 0;
+
+// Pure function: re-simulates from the fixed anchor forward to targetDateStr
+// every time it's called (no persisted mutable state), applying the
+// collision-skip rule at each step. Returns null if targetDateStr isn't a
+// valid slot-day (must be an even number of days after the anchor) or is
+// before the anchor.
+function computeCaravanRosterForDate(targetDateStr) {
+  const totalSlots = daysBetweenDateStrings(CARAVAN_ANCHOR_DATE, targetDateStr) / 2;
+  if (totalSlots < 0 || !Number.isInteger(totalSlots)) return null;
+
+  let amPtr = 4, pmPtr = 4; // values to use ON the anchor date itself
+  let result = null;
+
+  for (let i = 0; i <= totalSlots; i++) {
+    const amPerson = CARAVAN_AM_ROSTER[amPtr];
+    let pmIdx = pmPtr;
+    let pmPerson = CARAVAN_PM_ROSTER[pmIdx];
+    if (pmPerson.id === amPerson.id) {
+      pmIdx = (pmIdx + 1) % 5;
+      pmPerson = CARAVAN_PM_ROSTER[pmIdx];
+    }
+    if (i === totalSlots) {
+      result = { am: amPerson, pm: pmPerson };
+    }
+    amPtr = (amPtr + 1) % 5;
+    pmPtr = (pmIdx + 1) % 5;
+  }
+
+  return result;
+}
+
 const WOLF_EMOJI = '<:emoji_3:1525797281561841664>';
 
 // In-memory guard against duplicate "Request to Join" spam from the same
@@ -758,6 +851,234 @@ async function postShieldReminder(stage) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Caravan Coachman pings - fires at server 12:00 (AM slot) and server 00:00
+// (PM slot) on valid slot-days only. Pings the specific assigned person, not
+// a role, since this is an individual duty assignment.
+// ---------------------------------------------------------------------------
+function formatVipRemainingList() {
+  if (!VIP_MASTER.length) return 'No VIP list set up yet - ask a leader to `!add` some names.';
+  if (!VIP_REMAINING.length) return '🎉 Everyone has been VIP this cycle! An R4/R5 can run `!reset` to start a new one.';
+  return VIP_REMAINING.join(', ');
+}
+
+// Short version for the daily ping - a count, not the full list, since the
+// full list can approach Discord's 1024-char embed field limit as more
+// names get added over time. Full list stays available via "!viplist".
+function formatVipRemainingCount() {
+  if (!VIP_MASTER.length) return 'No VIP list set up yet - ask a leader to `!add` some names.';
+  if (!VIP_REMAINING.length) return '🎉 Everyone has been VIP this cycle! An R4/R5 can run `!reset` to start a new one.';
+  return `${VIP_REMAINING.length} candidate${VIP_REMAINING.length === 1 ? '' : 's'} remaining - use \`!viplist\` to see names.`;
+}
+
+async function postCaravanCoachmanPing(slot) {
+  if (!CARAVAN_CHANNEL_ID) return;
+
+  const todayStr = serverDateString(new Date());
+  const roster = computeCaravanRosterForDate(todayStr);
+  if (!roster) return; // not a valid slot-day - do nothing
+
+  const person = slot === 'am' ? roster.am : roster.pm;
+  const timeLabel = slot === 'am' ? '12:00' : '00:00';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🐫 Caravan Coachman Duty!')
+    .setDescription(
+      `<@${person.id}>, it's your turn to be Caravan Coachman for the **${timeLabel} server time** slot today!\n\n` +
+      `Please pick a VIP for the caravan.`
+    )
+    .addFields({ name: 'Remaining VIP candidates', value: formatVipRemainingCount() })
+    .setColor(0x9f7aea)
+    .setTimestamp(new Date());
+
+  const channel = await client.channels.fetch(CARAVAN_CHANNEL_ID);
+  if (channel) {
+    await channel.send({
+      content: `<@${person.id}>`,
+      embeds: [embed],
+      allowedMentions: { users: [person.id] },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VIP LIST COMMANDS - all five only work inside CARAVAN_CHANNEL_ID.
+// ---------------------------------------------------------------------------
+function isVipChannel(message) {
+  return CARAVAN_CHANNEL_ID && message.channel.id === CARAVAN_CHANNEL_ID;
+}
+
+function isTodaysCoachman(userId) {
+  const todayStr = serverDateString(new Date());
+  const roster = computeCaravanRosterForDate(todayStr);
+  if (!roster) return false;
+  return roster.am.id === userId || roster.pm.id === userId;
+}
+
+function findInList(list, name) {
+  return list.findIndex(n => n.toLowerCase() === name.toLowerCase());
+}
+
+// "!vip <name>" - today's coachman OR any R4/R5 can mark someone chosen.
+async function handleVipCommand(message) {
+  if (!isVipChannel(message)) return;
+
+  const isLeaderCaller = message.member.roles.cache.has(R4_ROLE_ID) || message.member.roles.cache.has(R5_ROLE_ID);
+  if (!isTodaysCoachman(message.author.id) && !isLeaderCaller) {
+    await message.reply("Only today's Coachman or an R4/R5 can pick a VIP.");
+    return;
+  }
+
+  const name = message.content.trim().split(/\s+/).slice(1).join(' ');
+  if (!name) {
+    await message.reply('Usage: `!vip <name>`');
+    return;
+  }
+
+  const idx = findInList(VIP_REMAINING, name);
+  if (idx === -1) {
+    await message.reply(`"${name}" isn't on the remaining VIP list - check \`!viplist\` for who's left.`);
+    return;
+  }
+
+  VIP_REMAINING.splice(idx, 1);
+  await message.reply(`✅ ${name} marked as VIP. Remaining: ${formatVipRemainingList()}`);
+}
+
+// "!viplist" - anyone can check who's left, informational only.
+async function handleVipListCommand(message) {
+  if (!isVipChannel(message)) return;
+  await message.reply(`**Remaining VIP candidates:** ${formatVipRemainingList()}`);
+}
+
+// "!status" - shows the Coachman schedule for the upcoming week (whichever
+// slot-days fall in the next 7 days).
+async function handleCaravanStatusCommand(message) {
+  if (!isVipChannel(message)) return;
+
+  const now = new Date();
+  const lines = [];
+  for (let i = 0; i < 8; i++) {
+    const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
+    const dateStr = serverDateString(d);
+    const roster = computeCaravanRosterForDate(dateStr);
+    if (!roster) continue; // not a valid slot-day
+    const label = i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : formatDateNice(dateStr);
+    lines.push(`**${label}** (${dateStr}) - 12:00: ${roster.am.name} | 00:00: ${roster.pm.name}`);
+  }
+
+  const body = lines.length ? lines.join('\n') : 'No scheduled slot-days in the next week.';
+  await message.reply(`**🐫 Caravan Coachman schedule - next 7 days:**\n${body}`);
+}
+
+// "!help" - lists everything scoped to this channel.
+async function handleCaravanHelpCommand(message) {
+  if (!isVipChannel(message)) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle('🐫 Caravan Channel Commands')
+    .setDescription(
+      `**Automatic:** daily pings at server 12:00 and 00:00 to that slot's Coachman, ` +
+      `including a count of remaining VIP candidates (use \`!viplist\` for the full names).\n\n` +
+      `**Commands (only work in this channel):**\n` +
+      `\`!vip <name>\` - today's Coachman or R4/R5 marks someone chosen\n` +
+      `\`!viplist\` - anyone can check who's left\n` +
+      `\`!status\` - see the Coachman schedule for the next 7 days\n` +
+      `\`!reset\` - R4/R5 refills the VIP list (button-confirmed)\n` +
+      `\`!add <name>\` - R4/R5 adds someone to the VIP pool (button-confirmed)\n` +
+      `\`!remove <name>\` - R4/R5 removes someone from the VIP pool (button-confirmed)\n` +
+      `\`!help\` - this message\n\n` +
+      `**Tip:** \`!timezone <ZONE>\` (works in any channel) also shows today's Coachman ` +
+      `times converted to your zone.`
+    )
+    .setColor(0x9f7aea);
+
+  await message.reply({ embeds: [embed] });
+}
+
+// Builds a generic confirm/cancel button row for a pending VIP action.
+function buildVipConfirmRow(actionKey) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`vipaction_confirm_${actionKey}`).setLabel('Confirm').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`vipaction_cancel_${actionKey}`).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+  );
+}
+
+function isVipLeader(message) {
+  return message.member.roles.cache.has(R4_ROLE_ID) || message.member.roles.cache.has(R5_ROLE_ID);
+}
+
+// "!reset" - R4/R5 only, refills VIP_REMAINING from VIP_MASTER. Confirmed.
+async function handleVipResetCommand(message) {
+  if (!isVipChannel(message)) return;
+  if (!isVipLeader(message)) {
+    await message.reply('Only R4/R5 can reset the VIP list.');
+    return;
+  }
+
+  const key = `${++vipActionCounter}`;
+  pendingVipActions.set(key, { type: 'reset' });
+
+  await message.reply({
+    content: `Reset the VIP list back to all ${VIP_MASTER.length} names? This cannot be undone.`,
+    components: [buildVipConfirmRow(key)],
+  });
+}
+
+// "!add <name>" - R4/R5 only, adds to VIP_MASTER (and VIP_REMAINING). Confirmed.
+async function handleVipAddCommand(message) {
+  if (!isVipChannel(message)) return;
+  if (!isVipLeader(message)) {
+    await message.reply('Only R4/R5 can add to the VIP list.');
+    return;
+  }
+
+  const name = message.content.trim().split(/\s+/).slice(1).join(' ');
+  if (!name) {
+    await message.reply('Usage: `!add <name>`');
+    return;
+  }
+  if (findInList(VIP_MASTER, name) !== -1) {
+    await message.reply(`"${name}" is already on the VIP list.`);
+    return;
+  }
+
+  const key = `${++vipActionCounter}`;
+  pendingVipActions.set(key, { type: 'add', name });
+
+  await message.reply({
+    content: `Add **${name}** to the VIP list?`,
+    components: [buildVipConfirmRow(key)],
+  });
+}
+
+// "!remove <name>" - R4/R5 only, removes from VIP_MASTER + VIP_REMAINING. Confirmed.
+async function handleVipRemoveCommand(message) {
+  if (!isVipChannel(message)) return;
+  if (!isVipLeader(message)) {
+    await message.reply('Only R4/R5 can remove from the VIP list.');
+    return;
+  }
+
+  const name = message.content.trim().split(/\s+/).slice(1).join(' ');
+  if (!name) {
+    await message.reply('Usage: `!remove <name>`');
+    return;
+  }
+  if (findInList(VIP_MASTER, name) === -1) {
+    await message.reply(`"${name}" isn't on the VIP list.`);
+    return;
+  }
+
+  const key = `${++vipActionCounter}`;
+  pendingVipActions.set(key, { type: 'remove', name });
+
+  await message.reply({
+    content: `Remove **${name}** from the VIP list? (they'll stop being eligible until re-added)`,
+    components: [buildVipConfirmRow(key)],
+  });
+}
+
 
 async function postLeaderSummary() {
   if (!LEADERS_CHANNEL_ID) return; // feature off if not configured
@@ -867,6 +1188,17 @@ async function handleTimezoneCommand(message) {
     })
     .join('\n');
   embed.addFields({ name: '🧀 Cheese Events', value: cheeseText });
+
+  const todayStr = serverDateString(realNow);
+  const caravanRoster = computeCaravanRosterForDate(todayStr);
+  if (caravanRoster) {
+    embed.addFields({
+      name: '🐫 Caravan Coachman (today)',
+      value: `${formatZoneHour(12, zoneOffset)} - ${caravanRoster.am.name}\n${formatZoneHour(0, zoneOffset)} - ${caravanRoster.pm.name}`,
+    });
+  } else {
+    embed.addFields({ name: '🐫 Caravan Coachman', value: 'Not a Coachman day today.' });
+  }
 
   embed
     .setFooter({ text: 'Fixed UTC offset - not DST-aware. Pick CET vs CEST / EST vs EDT etc. based on what currently applies.' })
@@ -1330,6 +1662,49 @@ client.on('interactionCreate', async (interaction) => {
         console.error('Error toggling pickroles role:', err.message);
         await interaction.reply({ content: 'Something went wrong - please tell a leader.', ephemeral: true }).catch(() => {});
       }
+      return;
+    }
+
+    const vipMatch = interaction.customId.match(/^vipaction_(confirm|cancel)_(\d+)$/);
+    if (vipMatch) {
+      const [, decision, key] = vipMatch;
+      const pending = pendingVipActions.get(key);
+
+      if (!pending) {
+        await interaction.reply({ content: 'This action has already been handled or expired.', ephemeral: true });
+        return;
+      }
+
+      const isLeaderClicker = interaction.member.roles.cache.has(R4_ROLE_ID) || interaction.member.roles.cache.has(R5_ROLE_ID);
+      if (!isLeaderClicker) {
+        await interaction.reply({ content: 'Only R4/R5 can confirm this.', ephemeral: true });
+        return;
+      }
+
+      pendingVipActions.delete(key);
+
+      if (decision === 'cancel') {
+        await interaction.update({ content: 'Cancelled - no changes made.', components: [] });
+        return;
+      }
+
+      let resultText;
+      if (pending.type === 'reset') {
+        VIP_REMAINING = [...VIP_MASTER];
+        resultText = `✅ VIP list reset - all ${VIP_MASTER.length} names are available again.`;
+      } else if (pending.type === 'add') {
+        VIP_MASTER.push(pending.name);
+        VIP_REMAINING.push(pending.name);
+        resultText = `✅ Added **${pending.name}** to the VIP list.`;
+      } else if (pending.type === 'remove') {
+        const masterIdx = findInList(VIP_MASTER, pending.name);
+        if (masterIdx !== -1) VIP_MASTER.splice(masterIdx, 1);
+        const remainingIdx = findInList(VIP_REMAINING, pending.name);
+        if (remainingIdx !== -1) VIP_REMAINING.splice(remainingIdx, 1);
+        resultText = `✅ Removed **${pending.name}** from the VIP list.`;
+      }
+
+      await interaction.update({ content: resultText, components: [] });
     }
   } catch (err) {
     console.error('Error handling button interaction:', err);
@@ -1370,6 +1745,20 @@ client.on('messageCreate', async (message) => {
       await handleSetupRolesCommand(message);
     } else if (content.startsWith('!clear')) {
       await handleClearCommand(message);
+    } else if (content.startsWith('!viplist')) {
+      await handleVipListCommand(message);
+    } else if (content.startsWith('!status')) {
+      await handleCaravanStatusCommand(message);
+    } else if (content.startsWith('!help')) {
+      await handleCaravanHelpCommand(message);
+    } else if (content.startsWith('!vip')) {
+      await handleVipCommand(message);
+    } else if (content.startsWith('!reset')) {
+      await handleVipResetCommand(message);
+    } else if (content.startsWith('!add')) {
+      await handleVipAddCommand(message);
+    } else if (content.startsWith('!remove')) {
+      await handleVipRemoveCommand(message);
     }
   } catch (err) {
     console.error('Error handling command:', err);
@@ -1417,7 +1806,15 @@ client.once('ready', () => {
   cron.schedule('0 1 * * 6', () => postShieldReminder('oneHour'), { timezone: 'Etc/UTC' });      // Fri 23:00 server (rolls to Sat UTC)
   cron.schedule('45 1 * * 6', () => postShieldReminder('fifteenMin'), { timezone: 'Etc/UTC' });  // Fri 23:45 server (rolls to Sat UTC)
 
-  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 00:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time), gather-prep reminder Sunday 20:00 server time (UTC ${gatherPrepUTCHour}), shield reminders Friday 00:00/21:00/23:00/23:45 server time.`);
+  // Caravan Coachman: checked daily at server 12:00 and server 00:00 - the
+  // function itself only actually posts on valid slot-days (every 2 days
+  // from the anchor), so these cron triggers are safe to run every day.
+  const caravanAMUTCHour = serverHourToUTCHour(12);
+  const caravanPMUTCHour = serverHourToUTCHour(0);
+  cron.schedule(`0 ${caravanAMUTCHour} * * *`, () => postCaravanCoachmanPing('am'), { timezone: 'Etc/UTC' });
+  cron.schedule(`0 ${caravanPMUTCHour} * * *`, () => postCaravanCoachmanPing('pm'), { timezone: 'Etc/UTC' });
+
+  console.log(`Cron jobs scheduled - SB every 4h (server hours ${SB_SLOT_HOURS.join(',')} -> UTC hours ${sbUTCHours.join(',')}), AD + leader summary daily at server 00:00 (UTC ${resetUTCHour}), cheese events checked every minute (defaults: Cheese 1 ${CHEESE_DEFAULTS[1].hour}:00, Cheese 2 ${CHEESE_DEFAULTS[2].hour}:00 server time), gather-prep reminder Sunday 20:00 server time (UTC ${gatherPrepUTCHour}), shield reminders Friday 00:00/21:00/23:00/23:45 server time, caravan coachman checked daily at server 12:00/00:00.`);
 });
 
 client.login(TOKEN);
