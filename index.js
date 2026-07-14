@@ -57,24 +57,33 @@ const GIFT_CODES_CHANNEL_ID = process.env.GIFT_CODES_CHANNEL_ID;
 // ---------------------------------------------------------------------------
 // CARAVAN COACHMAN ROTATION
 // Two independent rosters (12:00 and 00:00 server time slots), each cycling
-// every 2 days. If the SAME person would land both slots on the same day
-// (only possible for whoever is shared between both lists), the 00:00 slot
-// skips ahead to the next person in its own line rather than double-booking
-// them - this is a one-time-per-occurrence skip that then keeps the two
-// rotations naturally out of phase going forward.
+// every 2 days.
 //
-// The anchor date is the last confirmed real assignment (2026-07-30, where
-// 12:00 = Happy and this collision rule was first confirmed to apply).
-// Recomputed fresh from this anchor every time (not stored mutable state),
-// so it's safe across bot restarts.
+// PHASE 1 (before 2026-07-30): AM only had 4 people (lirco/ALI3N/Unity/Stone),
+// PM always had 5 (Maxx/sleepy/Freya/Bitz/Happy) - independent cycles, no
+// collision possible since Happy wasn't in AM yet.
+//
+// PHASE 2 (2026-07-30 onward): Happy joined AM too, making both lists 5
+// people. If the SAME person would land both slots the same day (only
+// possible for Happy, shared between both lists), the 00:00 slot skips
+// ahead to the next person in its own line - a one-time-per-occurrence skip
+// that then keeps the two rotations naturally out of phase going forward.
+//
+// Anchors verified against every real historical assignment given
+// (7/14 through 7/30) - all matched exactly before this was deployed.
+// Recomputed fresh every time (no persisted mutable state), so it's safe
+// across bot restarts.
 // ---------------------------------------------------------------------------
-const CARAVAN_ANCHOR_DATE = '2026-07-30';
+const CARAVAN_AM_PHASE1_ANCHOR = '2026-07-14'; // lirco = index 0
+const CARAVAN_PM_ANCHOR = '2026-07-12'; // Maxx = index 0
+const CARAVAN_PHASE2_START = '2026-07-30'; // AM expands to 5, collision rule begins
+
 const CARAVAN_AM_ROSTER = [
   { name: 'lirco', id: '413224675062185984' },
   { name: 'ALI3N', id: '1426962772260028539' },
   { name: 'Unity', id: '685176793560383513' },
   { name: 'Stone', id: '1068251448602800239' },
-  { name: 'Happy', id: '708051517386653698' },
+  { name: 'Happy', id: '708051517386653698' }, // only active from Phase 2 onward
 ];
 const CARAVAN_PM_ROSTER = [
   { name: 'Maxx', id: '296827369136717834' },
@@ -117,16 +126,28 @@ let VIP_REMAINING = [...VIP_MASTER]; // who hasn't been picked yet this cycle
 const pendingVipActions = new Map();
 let vipActionCounter = 0;
 
-// Pure function: re-simulates from the fixed anchor forward to targetDateStr
-// every time it's called (no persisted mutable state), applying the
-// collision-skip rule at each step. Returns null if targetDateStr isn't a
-// valid slot-day (must be an even number of days after the anchor) or is
-// before the anchor.
+// Pure function: handles both rotation phases, re-simulating fresh every
+// time it's called (no persisted mutable state). Returns null if
+// targetDateStr isn't a valid slot-day or is before the AM phase-1 anchor.
 function computeCaravanRosterForDate(targetDateStr) {
-  const totalSlots = daysBetweenDateStrings(CARAVAN_ANCHOR_DATE, targetDateStr) / 2;
+  if (targetDateStr < CARAVAN_PHASE2_START) {
+    // Phase 1: independent 4-person AM / 5-person PM cycles, no collision
+    // possible since Happy isn't in the AM roster yet during this phase.
+    const amDiff = daysBetweenDateStrings(CARAVAN_AM_PHASE1_ANCHOR, targetDateStr);
+    const pmDiff = daysBetweenDateStrings(CARAVAN_PM_ANCHOR, targetDateStr);
+    if (amDiff < 0 || pmDiff < 0 || amDiff % 2 !== 0 || pmDiff % 2 !== 0) return null;
+    const amIdx = (amDiff / 2) % 4;
+    const pmIdx = (pmDiff / 2) % 5;
+    return { am: CARAVAN_AM_ROSTER[amIdx], pm: CARAVAN_PM_ROSTER[pmIdx] };
+  }
+
+  // Phase 2: simulate from CARAVAN_PHASE2_START forward, applying the
+  // collision-skip rule at each step (amPtr/pmPtr=4 are the values used ON
+  // the phase-2 start date itself, matching the confirmed historical skip).
+  const totalSlots = daysBetweenDateStrings(CARAVAN_PHASE2_START, targetDateStr) / 2;
   if (totalSlots < 0 || !Number.isInteger(totalSlots)) return null;
 
-  let amPtr = 4, pmPtr = 4; // values to use ON the anchor date itself
+  let amPtr = 4, pmPtr = 4;
   let result = null;
 
   for (let i = 0; i <= totalSlots; i++) {
