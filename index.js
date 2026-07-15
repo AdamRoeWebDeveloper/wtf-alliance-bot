@@ -121,6 +121,12 @@ let VIP_MASTER = [
 ]; // full pool of eligible names (87 - all confirmed alliance members, excluding leadership AND all R4)
 let VIP_REMAINING = [...VIP_MASTER]; // who hasn't been picked yet this cycle
 
+// Tracks the server-time date (YYYY-MM-DD) each Coachman slot last actually
+// fired for, so both the normal cron trigger AND the startup catch-up check
+// (below) can agree on "has today's ping already gone out" without double-
+// firing if both happen to run close together.
+const caravanNotified = { am: null, pm: null };
+
 // Destructive actions (!reset, !add, !remove) need a button confirmation
 // before taking effect. Pending ones are tracked here, keyed by a short id.
 const pendingVipActions = new Map();
@@ -306,6 +312,16 @@ function daysBetweenDateStrings(aStr, bStr) {
   const a = new Date(aStr + 'T00:00:00Z');
   const b = new Date(bStr + 'T00:00:00Z');
   return Math.round((b.getTime() - a.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+// "2026-07-16" -> "2026-07-15". Needed because the Caravan PM slot fires 12h
+// AFTER its paired AM slot, which rolls the calendar date over by then - see
+// the big comment above postCaravanCoachmanPing for the full explanation.
+function subtractOneDay(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() - 1);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
 // Is the given server-time date string an active Cheese Event day? Active
@@ -892,12 +908,41 @@ function formatVipRemainingCount() {
   return `${VIP_REMAINING.length} candidate${VIP_REMAINING.length === 1 ? '' : 's'} remaining - use \`!viplist\` to see names.`;
 }
 
-async function postCaravanCoachmanPing(slot) {
-  if (!CARAVAN_CHANNEL_ID) return;
+// The rotation-day a given real moment's slot belongs to. AM (12:00) has no
+// ambiguity - it's just "today". PM (00:00) fires 12h after its paired AM
+// slot, rolling the calendar date over by then, so it needs "yesterday"
+// (relative to the real moment) to correctly pair with that same-cycle AM.
+function getCaravanRotationDate(slot, realNow) {
+  const rawTodayStr = serverDateString(realNow);
+  return slot === 'pm' ? subtractOneDay(rawTodayStr) : rawTodayStr;
+}
 
-  const todayStr = serverDateString(new Date());
+async function postCaravanCoachmanPing(slot) {
+  if (!CARAVAN_CHANNEL_ID) {
+    console.log(`Caravan ping (${slot}) skipped - CARAVAN_CHANNEL_ID not configured.`);
+    return;
+  }
+
+  // The PM (00:00) slot fires 12 HOURS AFTER its paired AM (12:00) slot on
+  // the same rotation day - which means the calendar date has already
+  // rolled over to the next day by the time PM fires. So PM must look up
+  // YESTERDAY's rotation-day (relative to firing) to correctly pair with
+  // the AM slot that fired 12h earlier, rather than looking up "today" as
+  // AM does. Confirmed against every historical AM/PM data point.
+  const todayStr = getCaravanRotationDate(slot, new Date());
+
   const roster = computeCaravanRosterForDate(todayStr);
-  if (!roster) return; // not a valid slot-day - do nothing
+  if (!roster) {
+    console.log(`Caravan ping (${slot}) skipped - ${todayStr} is not a valid slot-day.`);
+    return;
+  }
+
+  if (caravanNotified[slot] === todayStr) {
+    console.log(`Caravan ping (${slot}) skipped - already sent today (${todayStr}).`);
+    return; // already sent today (e.g. by the catch-up check)
+  }
+  caravanNotified[slot] = todayStr;
+  console.log(`Caravan ping (${slot}) firing for ${todayStr}.`);
 
   const person = slot === 'am' ? roster.am : roster.pm;
   const timeLabel = slot === 'am' ? '12:00' : '00:00';
@@ -912,13 +957,50 @@ async function postCaravanCoachmanPing(slot) {
     .setColor(0x9f7aea)
     .setTimestamp(new Date());
 
-  const channel = await client.channels.fetch(CARAVAN_CHANNEL_ID);
+  const channel = await client.channels.fetch(CARAVAN_CHANNEL_ID).catch(err => {
+    console.error(`Caravan ping (${slot}) FAILED - could not fetch channel:`, err.message);
+    return null;
+  });
   if (channel) {
-    await channel.send({
-      content: `<@${person.id}>`,
-      embeds: [embed],
-      allowedMentions: { users: [person.id] },
-    });
+    try {
+      await channel.send({
+        content: `<@${person.id}>`,
+        embeds: [embed],
+        allowedMentions: { users: [person.id] },
+      });
+      console.log(`Caravan ping (${slot}) sent successfully - ${person.name} for ${todayStr}.`);
+    } catch (err) {
+      console.error(`Caravan ping (${slot}) FAILED - channel.send() error:`, err.message);
+    }
+  } else {
+    console.error(`Caravan ping (${slot}) FAILED - CARAVAN_CHANNEL_ID (${CARAVAN_CHANNEL_ID}) did not resolve to a channel.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Startup catch-up: if the bot was down when a Coachman slot's scheduled
+// time passed today, this fires it immediately on next boot instead of
+// losing that day's ping entirely. Runs once in the 'ready' handler.
+//
+// PM (00:00) slot: if today hasn't been notified yet, its time has already
+// passed by definition (00:00 is the start of the day) - fire immediately.
+// AM (12:00) slot: only catches up if the current server time is actually
+// past 12:00 today AND it hasn't fired yet.
+// ---------------------------------------------------------------------------
+async function checkCaravanCatchUp() {
+  const now = new Date();
+
+  const pmDateStr = getCaravanRotationDate('pm', now);
+  if (computeCaravanRosterForDate(pmDateStr) && caravanNotified.pm !== pmDateStr) {
+    console.log('Caravan catch-up: PM slot missed today, firing now.');
+    await postCaravanCoachmanPing('pm');
+  }
+
+  const amDateStr = getCaravanRotationDate('am', now);
+  const serverHourNow = toServerTime(now).getUTCHours();
+  if (computeCaravanRosterForDate(amDateStr) && serverHourNow >= 12 && caravanNotified.am !== amDateStr) {
+    console.log('Caravan catch-up: AM slot missed today, firing now.');
+    await postCaravanCoachmanPing('am');
   }
 }
 
@@ -978,18 +1060,37 @@ async function handleCaravanStatusCommand(message) {
   if (!isVipChannel(message)) return;
 
   const now = new Date();
+  const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
   const lines = [];
-  for (let i = 0; i < 8; i++) {
+
+  for (let i = 0; i < 9; i++) {
     const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
     const dateStr = serverDateString(d);
-    const roster = computeCaravanRosterForDate(dateStr);
-    if (!roster) continue; // not a valid slot-day
     const label = i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : formatDateNice(dateStr);
-    lines.push(`**${label}** (${dateStr}) - 12:00: ${roster.am.name} | 00:00: ${roster.pm.name}`);
+
+    // 12:00 posting on dateStr - real UTC firing time = dateStr's midnight + 14h
+    // (12h server-clock + the 2h server-offset).
+    const amRoster = computeCaravanRosterForDate(dateStr);
+    if (amRoster) {
+      const amRealTime = new Date(dateStr + 'T14:00:00Z');
+      if (amRealTime > now && amRealTime <= sevenDaysFromNow) {
+        lines.push(`**${label}**, 12:00 - ${amRoster.am.name}`);
+      }
+    }
+
+    // 00:00 posting on dateStr - real UTC firing time = dateStr's midnight + 2h.
+    // Rooted in YESTERDAY's rotation-day (see subtractOneDay's comment above).
+    const pmRoster = computeCaravanRosterForDate(subtractOneDay(dateStr));
+    if (pmRoster) {
+      const pmRealTime = new Date(dateStr + 'T02:00:00Z');
+      if (pmRealTime > now && pmRealTime <= sevenDaysFromNow) {
+        lines.push(`**${label}**, 00:00 - ${pmRoster.pm.name}`);
+      }
+    }
   }
 
-  const body = lines.length ? lines.join('\n') : 'No scheduled slot-days in the next week.';
-  await message.reply(`**🐫 Caravan Coachman schedule - next 7 days:**\n${body}`);
+  const body = lines.length ? lines.join('\n') : 'No upcoming postings in the next 7 days.';
+  await message.reply(`**🐫 Caravan Coachman schedule - next 7 days (upcoming only):**\n${body}`);
 }
 
 // "!help" - lists everything scoped to this channel.
@@ -1795,6 +1896,8 @@ client.on('messageCreate', async (message) => {
 // ---------------------------------------------------------------------------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  checkCaravanCatchUp().catch(err => console.error('Error in caravan catch-up check:', err.message));
 
   const sbUTCHours = SB_SLOT_HOURS.map(serverHourToUTCHour); // e.g. [2,6,10,14,18,22]
   // CORRECTED: "03:00" was also a mislabeled BST reading, like SB was - true
