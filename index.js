@@ -107,6 +107,7 @@ const FALCON_QUEST_ROLE_ID = process.env.FALCON_QUEST_ROLE_ID;
 const VIP_STORAGE_CHANNEL_ID = process.env.VIP_STORAGE_CHANNEL_ID;
 let vipMasterMessage = null; // cached Message object, so we can .edit() without re-searching
 let vipRemainingMessage = null;
+let caravanNotifiedMessage = null; // stores caravanNotified.{am,pm} so restarts don't re-fire same-day pings
 
 // ---------------------------------------------------------------------------
 // VIP LIST (Caravan)
@@ -989,6 +990,7 @@ async function postCaravanCoachmanPing(slot) {
     return; // already sent today (e.g. by the catch-up check)
   }
   caravanNotified[slot] = todayStr;
+  await saveCaravanNotifiedToDiscord();
   console.log(`Caravan ping (${slot}) firing for ${todayStr}.`);
 
   const person = slot === 'am' ? roster.am : roster.pm;
@@ -1102,6 +1104,24 @@ async function saveVipRemainingToDiscord() {
   }
 }
 
+// Persists caravanNotified.{am,pm} so a restart doesn't forget "already sent
+// today" and fire a duplicate Coachman ping - this is what caused the
+// double-ping we saw after a redeploy.
+async function saveCaravanNotifiedToDiscord() {
+  if (!VIP_STORAGE_CHANNEL_ID) return;
+  const content = `CARAVANNOTIFIED:am=${caravanNotified.am || ''},pm=${caravanNotified.pm || ''}`;
+  try {
+    if (caravanNotifiedMessage) {
+      await caravanNotifiedMessage.edit(content);
+    } else {
+      const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
+      if (channel) caravanNotifiedMessage = await channel.send(content);
+    }
+  } catch (err) {
+    console.error('Failed to save caravan notified state to Discord:', err.message);
+  }
+}
+
 // Called once at startup - searches recent messages in the storage channel
 // for our own MASTER:/REMAINING: messages and restores state from them. If
 // none exist yet (first ever run), keeps the hardcoded defaults and creates
@@ -1131,10 +1151,23 @@ async function loadVipStateFromDiscord() {
       console.log(`Loaded VIP remaining list from Discord storage (${VIP_REMAINING.length} names).`);
     }
 
+    // CARAVANNOTIFIED:am=2026-07-16,pm=2026-07-15 (either side can be blank)
+    const notifiedMsg = ownMessages.find(m => m.content.startsWith('CARAVANNOTIFIED:'));
+    if (notifiedMsg) {
+      const raw = notifiedMsg.content.slice('CARAVANNOTIFIED:'.length);
+      raw.split(',').forEach(pair => {
+        const [key, val] = pair.split('=');
+        if (key === 'am' || key === 'pm') caravanNotified[key] = val || null;
+      });
+      caravanNotifiedMessage = notifiedMsg;
+      console.log(`Loaded caravan notified state from Discord storage (am=${caravanNotified.am}, pm=${caravanNotified.pm}).`);
+    }
+
     // First-ever run: no stored messages found yet - create them now with
     // the current (hardcoded default) state.
     if (!masterMsg) await saveVipMasterToDiscord();
     if (!remainingMsg) await saveVipRemainingToDiscord();
+    if (!notifiedMsg) await saveCaravanNotifiedToDiscord();
   } catch (err) {
     console.error('Failed to load VIP state from Discord:', err.message);
   }
@@ -2024,9 +2057,14 @@ client.on('messageCreate', async (message) => {
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  loadVipStateFromDiscord().catch(err => console.error('Error loading VIP state from Discord:', err.message));
-
-  checkCaravanCatchUp().catch(err => console.error('Error in caravan catch-up check:', err.message));
+  // MUST load persisted state before running catch-up - otherwise catch-up
+  // would see stale (null) caravanNotified values and fire a duplicate ping,
+  // exactly the bug this persistence was built to fix.
+  loadVipStateFromDiscord()
+    .catch(err => console.error('Error loading VIP state from Discord:', err.message))
+    .finally(() => {
+      checkCaravanCatchUp().catch(err => console.error('Error in caravan catch-up check:', err.message));
+    });
 
   const sbUTCHours = SB_SLOT_HOURS.map(serverHourToUTCHour); // e.g. [2,6,10,14,18,22]
   // CORRECTED: "03:00" was also a mislabeled BST reading, like SB was - true
