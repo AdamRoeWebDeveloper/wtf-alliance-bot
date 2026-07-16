@@ -93,6 +93,20 @@ const CARAVAN_PM_ROSTER = [
   { name: 'Happy', id: '708051517386653698' },
 ];
 const CARAVAN_CHANNEL_ID = process.env.CARAVAN_COACHMAN_CHANNEL_ID;
+const FALCON_QUEST_ROLE_ID = process.env.FALCON_QUEST_ROLE_ID;
+
+// ---------------------------------------------------------------------------
+// VIP LIST PERSISTENCE (via a hidden Discord channel)
+// Rather than a database, VIP_MASTER and VIP_REMAINING are stored as two
+// plain-text messages in a hidden channel - one edited whenever the master
+// list changes, one whenever the remaining list changes. On startup, the
+// bot reads these back to restore state, so a restart no longer loses
+// progress. Two separate messages (not one combined JSON blob) to stay well
+// under Discord's 2000-char message limit even as the list grows.
+// ---------------------------------------------------------------------------
+const VIP_STORAGE_CHANNEL_ID = process.env.VIP_STORAGE_CHANNEL_ID;
+let vipMasterMessage = null; // cached Message object, so we can .edit() without re-searching
+let vipRemainingMessage = null;
 
 // ---------------------------------------------------------------------------
 // VIP LIST (Caravan)
@@ -106,19 +120,19 @@ const CARAVAN_CHANNEL_ID = process.env.CARAVAN_COACHMAN_CHANNEL_ID;
 // TODO: seed VIP_MASTER with the real initial list - currently empty.
 // ---------------------------------------------------------------------------
 let VIP_MASTER = [
-  'Again2', 'NurseNikki', 'TWISTER', 'BDAalex', 'KirbyMorgan', 'MaryMonsterFairy', 'DinoDingo2b',
-  'MothaCoconuts', 'ArchonTiddles', 'XxLordRahlxX', 'CouryAZ41', 'Ass-Modiel', 'P4nd0ra', 'Karazuko',
-  'Chunnlei', 'Iza1234', 'Kisten', 'QuirkyTurkey13', 'DocOver', 'Kayotic101', 'woody4376',
-  'Indigo-Moon', 'Djmark3696', 'bayram047', 'Cannabinoid', 'Novacaine2', 'DoctorAnteros', 'psychohontas',
-  'MisterCrowley', 'Crappy', 'TankTerror', 'Coldcreature', 'Lukas1983', 'fetih', 'Savage-Kitty',
-  'O-Town', 'Lorita', 'NyxX', 'LordDenning', 'RachelGreen', 'Ame83', 'Moon313', 'MadamDefne', 'Ovais',
-  'Odinark', 'AmethystMoon', 'sleepinginthetub', 'Zoeking', 'Forgottenagain', 'MrMAV', 'RichardCypher',
-  'Amarah302', 'FuadAsyhary', 'Emirefe', 'DrMySs', 'ANGRYkOALA', 'JinCheonhee', 'Fragrance', 'fkIGG',
-  'kanaia', 'Terita', 'About4bees', 'Eleanor238', 'ThalionMora', 'Legionar', 'AG1', 'SoggyKoala',
-  'Phylisha', 'emiilii', 'goddessOFdiscord', 'Pandobrodiy', 'Raco78oner', 'ReqX', 'Angela28', 'D4Della',
-  'Phule-Ripp', 'SassyNat', 'TRex23', 'Darkrasp', 'NOTU', 'Saiyyajin', 'Lizzzardking', 'Daysbright',
-  'Lilithsdottir', 'GR99', 'warameo', 'CapyBear',
-]; // full pool of eligible names (87 - all confirmed alliance members, excluding leadership AND all R4)
+  'About4bees', 'AG1', 'Again2', 'Amarah302', 'Ame83', 'AmethystMoon', 'Angela28', 'ANGRYkOALA',
+  'ArchonTiddles', 'Ass-Modiel', 'bayram047', 'BDAalex', 'Cannabinoid', 'CapyBear', 'Chunnlei',
+  'Coldcreature', 'CouryAZ41', 'Crappy', 'D4Della', 'Darkrasp', 'Daysbright', 'DinoDingo2b',
+  'Djmark3696', 'DocOver', 'DoctorAnteros', 'DrMySs', 'Eleanor238', 'emiilii', 'Emirefe', 'fetih',
+  'fkIGG', 'Forgottenagain', 'Fragrance', 'FuadAsyhary', 'goddessOFdiscord', 'GR99', 'Indigo-Moon',
+  'Iza1234', 'JinCheonhee', 'kanaia', 'Karazuko', 'Kayotic101', 'KirbyMorgan', 'Kisten', 'Legionar',
+  'Lilithsdottir', 'Lizzzardking', 'LordDenning', 'Lorita', 'Lukas1983', 'MadamDefne',
+  'MaryMonsterFairy', 'MisterCrowley', 'Moon313', 'MothaCoconuts', 'MrMAV', 'NOTU', 'Novacaine2',
+  'NurseNikki', 'NyxX', 'O-Town', 'Odinark', 'Ovais', 'P4nd0ra', 'Pandobrodiy', 'Phule-Ripp',
+  'Phylisha', 'psychohontas', 'QuirkyTurkey13', 'RachelGreen', 'Raco78oner', 'ReqX', 'RichardCypher',
+  'Saiyyajin', 'SassyNat', 'Savage-Kitty', 'sleepinginthetub', 'SoggyKoala', 'TankTerror', 'Terita',
+  'ThalionMora', 'TRex23', 'TWISTER', 'warameo', 'woody4376', 'XxLordRahlxX', 'Zoeking',
+]; // full pool of eligible names (87), kept in alphabetical order (case-insensitive)
 let VIP_REMAINING = [...VIP_MASTER]; // who hasn't been picked yet this cycle
 
 // Tracks the server-time date (YYYY-MM-DD) each Coachman slot last actually
@@ -842,6 +856,39 @@ async function postGatherPrepReminder() {
 }
 
 // ---------------------------------------------------------------------------
+// Falcon Quest saving reminder - fires server 00:00 on Sat/Sun/Tue/Thu (the
+// days AD does NOT score Falcon Quest points). Reminds members to hold their
+// Falcon Quest slots rather than spend them, and explains why the regen
+// timer means there's no downside to saving up.
+// ---------------------------------------------------------------------------
+async function postFalconQuestSavingReminder() {
+  const embed = new EmbedBuilder()
+    .setTitle('🦅 Save Your Falcon Quests Today!')
+    .setDescription(
+      'Alliance Duel only scores Falcon Quest points on **Monday, Wednesday, and Friday** - ' +
+      "today is a saving day, so avoid spending down your stock too early, but don't let the timer stall either.\n\n" +
+      '**How the timer works:** your slots refill by an amount based on your level every 6 hours ' +
+      "(varies per player), but that timer only counts down while you're below your max capacity. " +
+      "If you hit max, the timer pauses until you spend some down.\n\n" +
+      "**The trick:** before you sleep or know you'll be away for a while, spend down BELOW max " +
+      "first - enough that your expected regen won't push you back up to the cap. For example, if " +
+      "your max is 40 and you regen 11 per cycle, spend down to 28 before sleeping, so after the " +
+      "tick you land at 39 (not capped at 40) and the timer keeps running the whole time you're away."
+    )
+    .setColor(0x805ad5)
+    .setTimestamp(new Date());
+
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  if (channel) {
+    await channel.send({
+      content: rolePing(FALCON_QUEST_ROLE_ID),
+      embeds: [embed],
+      allowedMentions: rolePingAllowedMentions(FALCON_QUEST_ROLE_ID),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shield reminders: a 4-stage countdown to Saturday's 00:00 server reset
 // (start of AD Day 6, "raid day"), pinging the Shield role. Fires on Friday
 // (the day before) at 00:00, then 21:00, 23:00, and 23:45 server time.
@@ -1022,6 +1069,77 @@ function findInList(list, name) {
   return list.findIndex(n => n.toLowerCase() === name.toLowerCase());
 }
 
+// ---------------------------------------------------------------------------
+// VIP list persistence - save after every mutation, load once on startup.
+// ---------------------------------------------------------------------------
+async function saveVipMasterToDiscord() {
+  if (!VIP_STORAGE_CHANNEL_ID) return;
+  const content = 'MASTER:' + VIP_MASTER.join(',');
+  try {
+    if (vipMasterMessage) {
+      await vipMasterMessage.edit(content);
+    } else {
+      const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
+      if (channel) vipMasterMessage = await channel.send(content);
+    }
+  } catch (err) {
+    console.error('Failed to save VIP master list to Discord:', err.message);
+  }
+}
+
+async function saveVipRemainingToDiscord() {
+  if (!VIP_STORAGE_CHANNEL_ID) return;
+  const content = 'REMAINING:' + VIP_REMAINING.join(',');
+  try {
+    if (vipRemainingMessage) {
+      await vipRemainingMessage.edit(content);
+    } else {
+      const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
+      if (channel) vipRemainingMessage = await channel.send(content);
+    }
+  } catch (err) {
+    console.error('Failed to save VIP remaining list to Discord:', err.message);
+  }
+}
+
+// Called once at startup - searches recent messages in the storage channel
+// for our own MASTER:/REMAINING: messages and restores state from them. If
+// none exist yet (first ever run), keeps the hardcoded defaults and creates
+// the initial messages.
+async function loadVipStateFromDiscord() {
+  if (!VIP_STORAGE_CHANNEL_ID) return;
+  try {
+    const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
+    if (!channel) return;
+
+    const recent = await channel.messages.fetch({ limit: 50 });
+    const ownMessages = recent.filter(m => m.author.id === client.user.id);
+
+    const masterMsg = ownMessages.find(m => m.content.startsWith('MASTER:'));
+    if (masterMsg) {
+      const raw = masterMsg.content.slice('MASTER:'.length);
+      VIP_MASTER = raw ? raw.split(',') : [];
+      vipMasterMessage = masterMsg;
+      console.log(`Loaded VIP master list from Discord storage (${VIP_MASTER.length} names).`);
+    }
+
+    const remainingMsg = ownMessages.find(m => m.content.startsWith('REMAINING:'));
+    if (remainingMsg) {
+      const raw = remainingMsg.content.slice('REMAINING:'.length);
+      VIP_REMAINING = raw ? raw.split(',') : [];
+      vipRemainingMessage = remainingMsg;
+      console.log(`Loaded VIP remaining list from Discord storage (${VIP_REMAINING.length} names).`);
+    }
+
+    // First-ever run: no stored messages found yet - create them now with
+    // the current (hardcoded default) state.
+    if (!masterMsg) await saveVipMasterToDiscord();
+    if (!remainingMsg) await saveVipRemainingToDiscord();
+  } catch (err) {
+    console.error('Failed to load VIP state from Discord:', err.message);
+  }
+}
+
 // "!vip <name>" - today's coachman OR any R4/R5 can mark someone chosen.
 async function handleVipCommand(message) {
   if (!isVipChannel(message)) return;
@@ -1045,6 +1163,7 @@ async function handleVipCommand(message) {
   }
 
   VIP_REMAINING.splice(idx, 1);
+  await saveVipRemainingToDiscord();
   await message.reply(`✅ ${name} marked as VIP. Remaining: ${formatVipRemainingList()}`);
 }
 
@@ -1813,16 +1932,24 @@ client.on('interactionCreate', async (interaction) => {
       let resultText;
       if (pending.type === 'reset') {
         VIP_REMAINING = [...VIP_MASTER];
+        await saveVipRemainingToDiscord();
         resultText = `✅ VIP list reset - all ${VIP_MASTER.length} names are available again.`;
       } else if (pending.type === 'add') {
         VIP_MASTER.push(pending.name);
         VIP_REMAINING.push(pending.name);
+        const caseInsensitiveSort = (a, b) => a.toLowerCase().localeCompare(b.toLowerCase());
+        VIP_MASTER.sort(caseInsensitiveSort);
+        VIP_REMAINING.sort(caseInsensitiveSort);
+        await saveVipMasterToDiscord();
+        await saveVipRemainingToDiscord();
         resultText = `✅ Added **${pending.name}** to the VIP list.`;
       } else if (pending.type === 'remove') {
         const masterIdx = findInList(VIP_MASTER, pending.name);
         if (masterIdx !== -1) VIP_MASTER.splice(masterIdx, 1);
         const remainingIdx = findInList(VIP_REMAINING, pending.name);
         if (remainingIdx !== -1) VIP_REMAINING.splice(remainingIdx, 1);
+        await saveVipMasterToDiscord();
+        await saveVipRemainingToDiscord();
         resultText = `✅ Removed **${pending.name}** from the VIP list.`;
       }
 
@@ -1897,6 +2024,8 @@ client.on('messageCreate', async (message) => {
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 
+  loadVipStateFromDiscord().catch(err => console.error('Error loading VIP state from Discord:', err.message));
+
   checkCaravanCatchUp().catch(err => console.error('Error in caravan catch-up check:', err.message));
 
   const sbUTCHours = SB_SLOT_HOURS.map(serverHourToUTCHour); // e.g. [2,6,10,14,18,22]
@@ -1912,6 +2041,11 @@ client.once('ready', () => {
 
   // Leaders channel: copy-paste summary, once daily alongside AD
   cron.schedule(`0 ${resetUTCHour} * * *`, postLeaderSummary, { timezone: 'Etc/UTC' });
+
+  // Falcon Quest saving reminder: server 00:00 on Sat/Sun/Tue/Thu (the 4 days
+  // AD does NOT score Falcon Quest points). Server 00:00 doesn't cross a UTC
+  // day boundary, so cron's day-of-week lines up directly with server weekday.
+  cron.schedule(`0 ${resetUTCHour} * * 0,2,4,6`, postFalconQuestSavingReminder, { timezone: 'Etc/UTC' });
 
   // Cheese events: checked every minute since custom times can have any minute value
   cron.schedule('* * * * *', checkCheeseTimers, { timezone: 'Etc/UTC' });
