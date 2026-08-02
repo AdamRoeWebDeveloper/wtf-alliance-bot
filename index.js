@@ -1346,25 +1346,30 @@ async function checkBirthdaysToday() {
   });
 }
 
-// "!birthdays" - shows remaining (not-yet-passed) birthdays for the current
-// calendar month, soonest first. Works in any channel, anyone can run it.
+// "!birthdays" - shows everyone's upcoming birthdays, soonest first. Rolls
+// past the end of the current month into next year rather than stopping,
+// so it never goes empty just because this month's birthdays have passed.
+// Works in any channel, anyone can run it.
 async function handleBirthdaysCommand(message) {
   const now = new Date();
-  const month = now.getUTCMonth() + 1;
-  const today = now.getUTCDate();
+  const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 
-  const remaining = Object.entries(USER_BIRTHDAYS)
-    .filter(([, bday]) => bday.month === month && bday.day >= today)
-    .sort((a, b) => a[1].day - b[1].day);
+  const upcoming = Object.entries(USER_BIRTHDAYS)
+    .map(([userId, bday]) => {
+      let next = new Date(Date.UTC(todayUTC.getUTCFullYear(), bday.month - 1, bday.day));
+      if (next < todayUTC) next = new Date(Date.UTC(todayUTC.getUTCFullYear() + 1, bday.month - 1, bday.day));
+      return { userId, bday, next };
+    })
+    .sort((a, b) => a.next - b.next);
 
   const embed = new EmbedBuilder()
-    .setTitle(`🎂 Remaining Birthdays - ${MONTH_NAMES_FULL[month - 1]}`)
+    .setTitle('🎂 Upcoming Birthdays')
     .setColor(0xf687b3);
 
-  if (!remaining.length) {
-    embed.setDescription('No more birthdays left this month.');
+  if (!upcoming.length) {
+    embed.setDescription('No birthdays set yet.');
   } else {
-    embed.setDescription(remaining.map(([userId, bday]) => `**${bday.day}** - <@${userId}>`).join('\n'));
+    embed.setDescription(upcoming.map(({ userId, bday }) => `**${MONTH_NAMES_FULL[bday.month - 1]} ${bday.day}** - <@${userId}>`).join('\n'));
   }
 
   await message.reply({ embeds: [embed] });
@@ -1376,7 +1381,7 @@ async function handleBirthdayHelpCommand(message) {
     .setTitle('🎂 Birthday Commands')
     .setDescription(
       `\`!birthday\` - set or redo your own birthday (sent via DM - pick month, then day)\n` +
-      `\`!birthdays\` - see remaining birthdays for the rest of this month\n` +
+      `\`!birthdays\` - see everyone's upcoming birthdays, soonest first\n` +
       `\`!setup-birthdays\` - (leaders) DMs everyone who hasn't set a birthday yet\n\n` +
       `**Automatic:** new members are asked to set theirs as soon as they're approved. ` +
       `Birthdays are announced daily at server 09:00 whenever it's someone's day - ` +
