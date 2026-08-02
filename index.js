@@ -1401,8 +1401,19 @@ async function loadVipStateFromDiscord() {
     const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
     if (!channel) return;
 
-    const recent = await channel.messages.fetch({ limit: 50 });
-    const ownMessages = recent.filter(m => m.author.id === client.user.id);
+    // Page back through up to 500 messages rather than just the most recent
+    // 50 - once other traffic in this channel pushes our storage messages
+    // past a small window, a single-page fetch stops finding them, which
+    // silently orphans whatever state they held (e.g. saved birthdays).
+    const ownMessages = [];
+    let before;
+    for (let page = 0; page < 5; page++) {
+      const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (!batch.size) break;
+      ownMessages.push(...batch.filter(m => m.author.id === client.user.id).values());
+      if (batch.size < 100) break;
+      before = batch.last().id;
+    }
 
     const masterMsg = ownMessages.find(m => m.content.startsWith('MASTER:'));
     if (masterMsg) {
@@ -1470,6 +1481,16 @@ async function loadVipStateFromDiscord() {
       });
       birthdayMessages = birthdayMsgs;
       console.log(`Loaded ${Object.keys(USER_BIRTHDAYS).length} birthdays from Discord storage across ${birthdayMsgs.length} message(s).`);
+
+      // Leftover duplicate chunk-index messages (e.g. two BIRTHDAYS0:'s) mean
+      // an earlier restart missed the real one and started a fresh one -
+      // immediately re-save the merged data so it collapses back to a single
+      // clean set of messages instead of staying split.
+      const indices = birthdayMsgs.map(m => parseInt(m.content.match(/^BIRTHDAYS(\d+):/)[1], 10));
+      if (new Set(indices).size !== indices.length) {
+        console.log('Found duplicate birthday storage messages - consolidating.');
+        await saveBirthdaysToDiscord();
+      }
     }
 
     // First-ever run: no stored messages found yet - create them now with
