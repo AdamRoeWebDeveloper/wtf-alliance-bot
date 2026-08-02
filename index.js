@@ -122,6 +122,12 @@ let USER_BIRTHDAYS = {}; // userId -> { month: 1-12, day: 1-31 }
 let birthdayMessages = []; // chunked storage - Discord IDs are long, so one message can't safely hold everyone
 const pendingBirthdayMonth = new Map(); // userId -> selected month, while awaiting their day pick
 
+// !reminder - private Shield/Minister DM reminders. Unrelated to the
+// existing weekly public postShieldReminder/SQUAD_ROLES.shield feature above.
+let PENDING_SHIELD_REMINDERS = {};   // userId -> { expiresAt: epochMs, duration: 8|12|24, sent: ['30','15','5'] }
+let PENDING_MINISTER_REMINDERS = {}; // userId -> { fireAt: epochMs, position: 1-50 }
+let reminderMessages = []; // chunked storage, mirrors birthdayMessages
+
 const MONTH_NAMES_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 const DAYS_IN_MONTH = [31,29,31,30,31,30,31,31,30,31,30,31]; // Feb=29 to be safe for leap years
 
@@ -480,6 +486,49 @@ async function checkCheeseTimers() {
       notified.start = today;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// !reminder delivery - runs every minute, compares against the absolute
+// timestamps loaded from storage (not exact equality), so a missed/delayed
+// tick still catches up on the next run, same tolerance as checkCheeseTimers.
+// ---------------------------------------------------------------------------
+async function dmReminder(userId, content) {
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(content);
+  } catch (err) {
+    console.error(`Failed to DM reminder to ${userId}:`, err.message);
+  }
+}
+
+async function checkPendingReminders() {
+  const now = Date.now();
+  let changed = false;
+
+  for (const [userId, r] of Object.entries(PENDING_SHIELD_REMINDERS)) {
+    for (const [label, minutesBefore] of [['30', 30], ['15', 15], ['5', 5]]) {
+      if (now >= r.expiresAt - minutesBefore * 60000 && !r.sent.includes(label)) {
+        await dmReminder(userId, `🛡️ Your shield expires in **${minutesBefore} minutes**!`);
+        r.sent.push(label);
+        changed = true;
+      }
+    }
+    if (now >= r.expiresAt) {
+      delete PENDING_SHIELD_REMINDERS[userId];
+      changed = true;
+    }
+  }
+
+  for (const [userId, r] of Object.entries(PENDING_MINISTER_REMINDERS)) {
+    if (now >= r.fireAt) {
+      await dmReminder(userId, `👑 Your Minister turn should be starting now (you were **#${r.position}**).`);
+      delete PENDING_MINISTER_REMINDERS[userId];
+      changed = true;
+    }
+  }
+
+  if (changed) await saveRemindersToDiscord();
 }
 
 function isLeader(message) {
@@ -1207,6 +1256,61 @@ async function saveBirthdaysToDiscord() {
 }
 
 // ---------------------------------------------------------------------------
+// REMINDER PERSISTENCE - chunked the same way as birthdays, sharing one
+// REMINDERS0:, REMINDERS1:, ... stream for both shield and minister entries
+// (type-prefixed per entry since the two kinds have different fields):
+//   shield:<userId>:<expiresAtMs>:<duration>:<sentFlags>   (sentFlags e.g. "30-15" or empty)
+//   minister:<userId>:<fireAtMs>:<position>
+// ---------------------------------------------------------------------------
+async function saveRemindersToDiscord() {
+  if (!VIP_STORAGE_CHANNEL_ID) return;
+
+  const entries = [
+    ...Object.entries(PENDING_SHIELD_REMINDERS).map(
+      ([id, r]) => `shield:${id}:${r.expiresAt}:${r.duration}:${r.sent.join('-')}`
+    ),
+    ...Object.entries(PENDING_MINISTER_REMINDERS).map(
+      ([id, r]) => `minister:${id}:${r.fireAt}:${r.position}`
+    ),
+  ];
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+  const SAFE_LIMIT = 1800; // headroom under Discord's 2000-char limit
+
+  for (const entry of entries) {
+    if (current.length && currentLen + entry.length + 1 > SAFE_LIMIT) {
+      chunks.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(entry);
+    currentLen += entry.length + 1;
+  }
+  if (current.length || chunks.length === 0) chunks.push(current);
+
+  try {
+    const channel = await client.channels.fetch(VIP_STORAGE_CHANNEL_ID);
+    if (!channel) return;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const content = `REMINDERS${i}:` + chunks[i].join(',');
+      if (reminderMessages[i]) {
+        await reminderMessages[i].edit(content);
+      } else {
+        reminderMessages[i] = await channel.send(content);
+      }
+    }
+    for (let i = chunks.length; i < reminderMessages.length; i++) {
+      if (reminderMessages[i]) await reminderMessages[i].delete().catch(() => {});
+    }
+    reminderMessages.length = chunks.length;
+  } catch (err) {
+    console.error('Failed to save reminders to Discord:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // BIRTHDAY DM FLOW
 // Month select menu -> (updates same message to) a day select menu, split
 // into two if the month has more than 25 days (Discord's per-menu cap).
@@ -1386,6 +1490,71 @@ async function handleBirthdayHelpCommand(message) {
   await message.reply({ embeds: [embed] });
 }
 
+// ---------------------------------------------------------------------------
+// "!reminder" - private DM reminders for Shield (8/12/24h countdown) or
+// Minister (queue position ETA). Unrelated to the existing weekly public
+// postShieldReminder/SQUAD_ROLES.shield feature above - that pings a role
+// on a fixed schedule, this is a personal on-demand DM countdown.
+// ---------------------------------------------------------------------------
+function buildReminderTypeMessage() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('reminder_type_shield').setLabel('🛡️ Shield').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('reminder_type_minister').setLabel('👑 Minister').setStyle(ButtonStyle.Primary)
+  );
+  return {
+    content: "Pick what you'd like a private DM reminder for:",
+    components: [row],
+  };
+}
+
+function buildShieldDurationMenu() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('reminder_shield_duration')
+    .setPlaceholder('How long is your shield?')
+    .addOptions(
+      { label: '8 hours', value: '8' },
+      { label: '12 hours', value: '12' },
+      { label: '24 hours', value: '24' }
+    );
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+function buildMinisterPositionComponents() {
+  // 50 positions, split into two 25-option menus (Discord's per-menu cap) -
+  // mirrors buildBirthdayDayComponents's split for months with >25 days.
+  const makeOptions = (start, end) =>
+    Array.from({ length: end - start + 1 }, (_, i) => ({ label: `#${start + i}`, value: String(start + i) }));
+
+  const menuA = new StringSelectMenuBuilder()
+    .setCustomId('reminder_minister_pos_a')
+    .setPlaceholder('Position (1-25)')
+    .addOptions(makeOptions(1, 25));
+  const menuB = new StringSelectMenuBuilder()
+    .setCustomId('reminder_minister_pos_b')
+    .setPlaceholder('Position (26-50)')
+    .addOptions(makeOptions(26, 50));
+  return [new ActionRowBuilder().addComponents(menuA), new ActionRowBuilder().addComponents(menuB)];
+}
+
+async function handleReminderCommand(message) {
+  await message.reply(buildReminderTypeMessage());
+}
+
+// "!help reminder" - lists everything related to the reminder feature.
+async function handleReminderHelpCommand(message) {
+  const embed = new EmbedBuilder()
+    .setTitle('⏰ Reminder Commands')
+    .setDescription(
+      `\`!reminder\` - get a private DM reminder for your shield or Minister queue spot\n\n` +
+      `**🛡️ Shield:** pick 8/12/24 hours - I'll DM you at 30, 15, and 5 minutes before it expires.\n` +
+      `**👑 Minister:** pick your position in the queue (1-50, ~5 minutes per turn) - I'll DM you ` +
+      `once around when it should be your turn. Since cancellations only ever shorten the real ` +
+      `wait, this is a worst-case estimate.`
+    )
+    .setColor(0x38b2ac);
+  await message.reply({ embeds: [embed] });
+}
+
 // Called once at startup - searches recent messages in the storage channel
 // for our own MASTER:/REMAINING: messages and restores state from them. If
 // none exist yet (first ever run), keeps the hardcoded defaults and creates
@@ -1488,6 +1657,50 @@ async function loadVipStateFromDiscord() {
       }
     }
 
+    // REMINDERS0:, REMINDERS1:, ... - chunked shield+minister reminders, each
+    // entry type-prefixed since the two kinds have different fields.
+    const reminderMsgs = ownMessages
+      .filter(m => /^REMINDERS\d+:/.test(m.content))
+      .sort((a, b) => {
+        const numA = parseInt(a.content.match(/^REMINDERS(\d+):/)[1], 10);
+        const numB = parseInt(b.content.match(/^REMINDERS(\d+):/)[1], 10);
+        return numA - numB;
+      });
+    if (reminderMsgs.length) {
+      PENDING_SHIELD_REMINDERS = {};
+      PENDING_MINISTER_REMINDERS = {};
+      reminderMsgs.forEach(msg => {
+        const raw = msg.content.replace(/^REMINDERS\d+:/, '');
+        if (!raw) return;
+        raw.split(',').forEach(entry => {
+          const parts = entry.split(':');
+          const [type, id] = parts;
+          if (!id) return;
+          if (type === 'shield') {
+            const [, , expiresAt, duration, sentFlags] = parts;
+            PENDING_SHIELD_REMINDERS[id] = {
+              expiresAt: Number(expiresAt),
+              duration: Number(duration),
+              sent: sentFlags ? sentFlags.split('-') : [],
+            };
+          } else if (type === 'minister') {
+            const [, , fireAt, position] = parts;
+            PENDING_MINISTER_REMINDERS[id] = { fireAt: Number(fireAt), position: Number(position) };
+          }
+        });
+      });
+      reminderMessages = reminderMsgs;
+      console.log(
+        `Loaded ${Object.keys(PENDING_SHIELD_REMINDERS).length} shield and ${Object.keys(PENDING_MINISTER_REMINDERS).length} minister reminder(s) from Discord storage across ${reminderMsgs.length} message(s).`
+      );
+
+      const reminderIndices = reminderMsgs.map(m => parseInt(m.content.match(/^REMINDERS(\d+):/)[1], 10));
+      if (new Set(reminderIndices).size !== reminderIndices.length) {
+        console.log('Found duplicate reminder storage messages - consolidating.');
+        await saveRemindersToDiscord();
+      }
+    }
+
     // First-ever run: no stored messages found yet - create them now with
     // the current (hardcoded default) state.
     if (!masterMsg) await saveVipMasterToDiscord();
@@ -1495,6 +1708,7 @@ async function loadVipStateFromDiscord() {
     if (!birthdayMsgs.length) await saveBirthdaysToDiscord();
     if (!notifiedMsg) await saveCaravanNotifiedToDiscord();
     if (!historyMsg) await saveVipHistoryToDiscord();
+    if (!reminderMsgs.length) await saveRemindersToDiscord();
   } catch (err) {
     console.error('Failed to load VIP state from Discord:', err.message);
   }
@@ -2147,7 +2361,41 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
+      if (interaction.customId === 'reminder_shield_duration') {
+        const duration = parseInt(interaction.values[0], 10);
+        const expiresAt = Date.now() + duration * 60 * 60 * 1000;
+        PENDING_SHIELD_REMINDERS[interaction.user.id] = { expiresAt, duration, sent: [] };
+        await saveRemindersToDiscord();
+        await interaction.update({
+          content: `✅ Shield reminder set for **${duration}h**. I'll DM you at 30/15/5 minutes before it expires.`,
+          components: [],
+        });
+        return;
+      }
+
+      if (['reminder_minister_pos_a', 'reminder_minister_pos_b'].includes(interaction.customId)) {
+        const position = parseInt(interaction.values[0], 10);
+        const etaMinutes = (position - 1) * 5;
+        const fireAt = Date.now() + etaMinutes * 60 * 1000;
+        PENDING_MINISTER_REMINDERS[interaction.user.id] = { fireAt, position };
+        await saveRemindersToDiscord();
+        await interaction.update({
+          content: `✅ Minister reminder set - you're **#${position}**. I'll DM you in about **${etaMinutes} minutes**.`,
+          components: [],
+        });
+        return;
+      }
+
       return; // unrecognized select menu - ignore
+    }
+
+    if (interaction.customId === 'reminder_type_shield') {
+      await interaction.reply({ content: 'Pick your shield duration:', components: buildShieldDurationMenu(), ephemeral: true });
+      return;
+    }
+    if (interaction.customId === 'reminder_type_minister') {
+      await interaction.reply({ content: 'Pick your position in the queue:', components: buildMinisterPositionComponents(), ephemeral: true });
+      return;
     }
 
     if (interaction.customId === 'request_join') {
@@ -2423,6 +2671,8 @@ client.on('messageCreate', async (message) => {
       await handleCaravanStatusCommand(message);
     } else if (content.startsWith('!help birthday')) {
       await handleBirthdayHelpCommand(message);
+    } else if (content.startsWith('!help reminder')) {
+      await handleReminderHelpCommand(message);
     } else if (content.startsWith('!help')) {
       await handleCaravanHelpCommand(message);
     } else if (content.startsWith('!vip')) {
@@ -2439,6 +2689,8 @@ client.on('messageCreate', async (message) => {
       await handleBirthdaysCommand(message);
     } else if (content.startsWith('!birthday')) {
       await handleBirthdayCommand(message);
+    } else if (content.startsWith('!reminder')) {
+      await handleReminderCommand(message);
     }
   } catch (err) {
     console.error('Error handling command:', err);
@@ -2491,6 +2743,9 @@ client.once('ready', () => {
 
   // Cheese events: checked every minute since custom times can have any minute value
   cron.schedule('* * * * *', checkCheeseTimers, { timezone: 'Etc/UTC' });
+
+  // !reminder delivery: checked every minute against absolute stored timestamps
+  cron.schedule('* * * * *', checkPendingReminders, { timezone: 'Etc/UTC' });
 
   // Gather-prep reminder: once weekly, Sunday 20:00 server time (~4h before
   // Monday's AD reset). Server 20:00 doesn't cross a UTC day boundary, so
