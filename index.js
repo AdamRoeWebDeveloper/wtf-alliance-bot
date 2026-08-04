@@ -56,9 +56,11 @@ const ROLES_CHANNEL_ID = process.env.ROLES_CHANNEL_ID;
 const RAW_GIFT_FEED_CHANNEL_ID = process.env.RAW_GIFT_FEED_CHANNEL_ID;
 const GIFT_CODES_CHANNEL_ID = process.env.GIFT_CODES_CHANNEL_ID;
 
-// Players of the Week - posting an image in this channel (any image, no
-// command syntax needed) starts the submission flow.
+// Players of the Week - posting an image in POTW_SUBMIT_CHANNEL_ID (any
+// image, no command syntax needed) starts the submission flow; confirming
+// the draft posts the final announcement into POTW_ANNOUNCE_CHANNEL_ID.
 const POTW_SUBMIT_CHANNEL_ID = process.env.POTW_SUBMIT_CHANNEL_ID;
+const POTW_ANNOUNCE_CHANNEL_ID = process.env.POTW_ANNOUNCE_CHANNEL_ID;
 let pendingPotwSubmissions = new Map(); // key -> { imageUrl, submitterId, category, period, adDay, rows }
 let potwSubmissionCounter = 0;
 
@@ -1783,7 +1785,8 @@ async function handlePotwHelpCommand(message) {
       `just attach the image.\n\n` +
       `I'll ask which leaderboard it is (Alliance Duel or Donations), then which day or whether ` +
       `it's the weekly total, then read the top 5 names and scores out of the image and show you ` +
-      `a draft. **Confirm** posts it, **Edit** lets you fix anything I misread, **Cancel** discards it.`
+      `a draft. **Confirm** posts the announcement, **Edit** lets you fix anything I misread, ` +
+      `**Cancel** discards it.`
     )
     .setColor(0xf6ad55);
   await message.reply({ embeds: [embed] });
@@ -2748,7 +2751,19 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const embed = buildPotwEmbed(pending);
-      await interaction.update({ content: null, embeds: [embed], components: [] });
+      const announceChannelId = POTW_ANNOUNCE_CHANNEL_ID || interaction.channelId;
+      try {
+        if (announceChannelId !== interaction.channelId) {
+          const announceChannel = await client.channels.fetch(announceChannelId);
+          if (announceChannel) await announceChannel.send({ embeds: [embed] });
+          await interaction.update({ content: `✅ Posted in <#${announceChannelId}>!`, embeds: [], components: [] });
+        } else {
+          await interaction.update({ content: null, embeds: [embed], components: [] });
+        }
+      } catch (err) {
+        console.error('Failed to post Players of the Week announcement:', err.message);
+        await interaction.update({ content: 'Something went wrong posting the announcement - please tell a leader.', embeds: [], components: [] }).catch(() => {});
+      }
       return;
     }
 
