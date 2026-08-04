@@ -1,7 +1,9 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const cron = require('node-cron');
 const http = require('http');
+const { Jimp } = require('jimp');
+const { createWorker } = require('tesseract.js');
 
 // Minimal health-check server. This bot has no web interface of its own, but
 // some hosts (Railway included, depending on how the service is configured)
@@ -53,6 +55,12 @@ const ROLES_CHANNEL_ID = process.env.ROLES_CHANNEL_ID;
 // ---------------------------------------------------------------------------
 const RAW_GIFT_FEED_CHANNEL_ID = process.env.RAW_GIFT_FEED_CHANNEL_ID;
 const GIFT_CODES_CHANNEL_ID = process.env.GIFT_CODES_CHANNEL_ID;
+
+// Players of the Week - posting an image in this channel (any image, no
+// command syntax needed) starts the submission flow.
+const POTW_SUBMIT_CHANNEL_ID = process.env.POTW_SUBMIT_CHANNEL_ID;
+let pendingPotwSubmissions = new Map(); // key -> { imageUrl, submitterId, category, period, adDay, rows }
+let potwSubmissionCounter = 0;
 
 // ---------------------------------------------------------------------------
 // CARAVAN COACHMAN ROTATION
@@ -773,6 +781,216 @@ function getSBDay(date) {
 function getADDay(date) {
   const map = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 };
   return map[getUTCWeekday(date)] || null;
+}
+
+// ---------------------------------------------------------------------------
+// PLAYERS OF THE WEEK - OCR extraction
+// Reads the top 5 rows out of an Alliance Duel or Donation leaderboard
+// screenshot. Runs entirely locally (tesseract.js + jimp, no paid API, no
+// disk writes - the image only ever exists as an in-memory Buffer).
+//
+// Rank 1-3 are rendered as decorative medal badge icons in these screenshots,
+// not real text, so there is no OCR'd rank digit to key off for the top few
+// rows. Instead each row is anchored on its score (a reliable, always-present
+// comma-formatted number) and rank is assigned by vertical order top-to-bottom
+// rather than by reading a rank number - see the prototype testing notes in
+// the approved plan for how this was derived against 5 real screenshots.
+// ---------------------------------------------------------------------------
+async function downloadImageBuffer(url) {
+  const res = await fetch(url);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+async function preprocessForOCR(buffer) {
+  const img = await Jimp.read(buffer);
+  img.greyscale().contrast(0.35);
+  return { buffer: await img.getBuffer('image/png'), width: img.width };
+}
+
+function flattenOcrWords(data) {
+  const words = [];
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        for (const word of line.words || []) words.push(word);
+      }
+    }
+  }
+  return words
+    .map(w => ({ text: w.text.trim(), x0: w.bbox.x0, yc: (w.bbox.y0 + w.bbox.y1) / 2 }))
+    .filter(w => w.text.length > 0);
+}
+
+// Filters out OCR misreads of decorative elements (role badges, the alliance
+// tag line, avatar-border artifacts) that would otherwise get swept into a
+// name. Not perfect - the Edit step exists precisely to catch what slips
+// through - but this removes the bulk of it.
+const POTW_NOISE_RE = /^(R[3-5]j?|\[?WTF\]?wake|the|feral|my|alliance)$/i;
+function isPotwNoiseWord(text) {
+  if (text.length < 3) return true;
+  if (POTW_NOISE_RE.test(text)) return true;
+  if (/^\[?wtf\]?/i.test(text)) return true;
+  const alnum = text.replace(/[^a-zA-Z0-9]/g, '');
+  if (alnum.length === 0) return true;
+  if (alnum.length / text.length < 0.6) return true;
+  return false;
+}
+
+// Anchors on score words (comma-formatted numbers) since those are reliable
+// and always one-per-row. For each score, the name is whatever plausible text
+// sits in the name column (right of the avatar/badge clutter, left of the
+// score) within a vertical band that covers a one-line name (Donation) or a
+// name-line-above-the-score (Alliance Duel), while excluding the alliance-tag
+// line that sits further below.
+function parseTopPotwRows(words, imgWidth, topN = 5) {
+  const nameColMinX = imgWidth * 0.32;
+  const scoreWords = words
+    .filter(w => /^\d{1,3}(,\d{3})+$/.test(w.text))
+    .sort((a, b) => a.yc - b.yc);
+
+  const rows = [];
+  for (const score of scoreWords) {
+    const nameWords = words
+      .filter(w => w !== score && w.x0 >= nameColMinX && w.x0 < score.x0 && w.yc >= score.yc - 70 && w.yc <= score.yc + 15)
+      .filter(w => !isPotwNoiseWord(w.text))
+      .sort((a, b) => a.x0 - b.x0);
+    const name = nameWords.map(w => w.text).join(' ').trim();
+    if (!name) continue; // no plausible name found for this score - skip rather than guess
+    rows.push({ name, score: score.text, yc: score.yc });
+  }
+  rows.sort((a, b) => a.yc - b.yc);
+  return rows.slice(0, topN).map((r, i) => ({ rank: i + 1, name: r.name, score: r.score }));
+}
+
+async function extractTopPlayers(imageUrl, topN = 5) {
+  const rawBuffer = await downloadImageBuffer(imageUrl);
+  const { buffer, width } = await preprocessForOCR(rawBuffer);
+
+  const worker = await createWorker('eng');
+  try {
+    const { data } = await worker.recognize(buffer, {}, { blocks: true });
+    const words = flattenOcrWords(data);
+    return parseTopPotwRows(words, width, topN);
+  } finally {
+    await worker.terminate();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PLAYERS OF THE WEEK - submission flow
+// Posting an image in POTW_SUBMIT_CHANNEL_ID starts a short button/select
+// flow (category -> day-or-weekly -> draft preview) ending in a
+// Confirm/Edit/Cancel step before anything is posted publicly. Pending
+// submissions live only in memory (pendingPotwSubmissions), same as
+// pendingVipActions/pendingBirthdayMonth - a restart mid-flow just means
+// re-posting the screenshot.
+// ---------------------------------------------------------------------------
+const AD_DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const POTW_MEDALS = { 1: '🥇', 2: '🥈', 3: '🥉' };
+
+function buildPotwCategoryButtons(key) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`potw_cat_ad_${key}`).setLabel('⚔️ Alliance Duel').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`potw_cat_don_${key}`).setLabel('💰 Alliance Donations').setStyle(ButtonStyle.Primary)
+  );
+  return { content: 'Which leaderboard is this screenshot for?', components: [row] };
+}
+
+function buildPotwAdDaySelect(key) {
+  const options = AD_DAY_NAMES.map((name, idx) => {
+    const day = idx + 1;
+    return { label: `${name} - ${AD_SCHEDULE[day].theme}`, value: String(day) };
+  });
+  options.push({ label: 'Weekly (week just gone)', value: 'weekly' });
+  const menu = new StringSelectMenuBuilder().setCustomId(`potw_adperiod_${key}`).setPlaceholder('Which day, or weekly?').addOptions(options);
+  return { content: 'Which day is this Alliance Duel screenshot for (or is it the weekly total)?', components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+function buildPotwDonationPeriodButtons(key) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`potw_donperiod_daily_${key}`).setLabel('Daily').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`potw_donperiod_weekly_${key}`).setLabel('Weekly (week just gone)').setStyle(ButtonStyle.Secondary)
+  );
+  return { content: 'Is this the daily or weekly donation leaderboard?', components: [row] };
+}
+
+// Shared title/flavor copy for both the draft preview and the final post.
+function potwTitleAndFlavor(pending) {
+  if (pending.category === 'ad') {
+    if (pending.period === 'weekly') {
+      return { title: '🏆 Players of the Week — Alliance Duel (Weekly)', flavor: "This week's top 5 — congratulations! 🎉" };
+    }
+    const dayName = AD_DAY_NAMES[pending.adDay - 1];
+    const theme = AD_SCHEDULE[pending.adDay].theme;
+    return {
+      title: '🏆 Players of the Week — Alliance Duel (Daily)',
+      flavor: `${dayName}'s top 5 on **${theme}** — congratulations! 🎉`,
+    };
+  }
+  const label = pending.period === 'weekly' ? 'Weekly' : 'Daily';
+  return {
+    title: `🏆 Players of the Week — Donations (${label})`,
+    flavor: `${pending.period === 'weekly' ? "This week's" : "Today's"} top 5 donors — thank you for keeping the alliance strong! 💪`,
+  };
+}
+
+function formatPotwRow(row) {
+  const medal = POTW_MEDALS[row.rank];
+  return medal ? `${medal} **${row.name}** — ${row.score}` : `**${row.rank}.** ${row.name} — ${row.score}`;
+}
+
+function buildPotwEmbed(pending) {
+  const { title, flavor } = potwTitleAndFlavor(pending);
+  const closing = pending.category === 'ad' ? '*Great work — keep it up!*' : '*Massive thanks for the support!*';
+  const rowsText = pending.rows.length ? pending.rows.map(formatPotwRow).join('\n') : '*No rows extracted - use Edit to fill them in.*';
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(`${flavor}\n\n${rowsText}\n\n${closing}`)
+    .setColor(0xf6ad55);
+}
+
+function buildPotwDraftComponents(key) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`potw_confirm_${key}`).setLabel('Confirm').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`potw_edit_${key}`).setLabel('Edit').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`potw_cancel_${key}`).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+    ),
+  ];
+}
+
+// Called once the category + period are both known - runs OCR and shows the
+// draft preview. Shared by the AD-day-select and donation-period-button paths.
+async function runPotwExtractionAndShowDraft(interaction, key) {
+  const pending = pendingPotwSubmissions.get(key);
+  if (!pending) {
+    await interaction.update({ content: 'This submission has expired - please post the screenshot again.', components: [] });
+    return;
+  }
+
+  await interaction.deferUpdate(); // OCR takes longer than the 3s interaction window allows
+
+  try {
+    pending.rows = await extractTopPlayers(pending.imageUrl, 5);
+  } catch (err) {
+    console.error('POTW OCR extraction failed:', err.message);
+    pending.rows = [];
+  }
+
+  const embed = buildPotwEmbed(pending).setFooter({ text: '📝 Draft - check this looks right before confirming' });
+  await interaction.editReply({ content: null, embeds: [embed], components: buildPotwDraftComponents(key) });
+}
+
+// "an image posted in POTW_SUBMIT_CHANNEL_ID" - the trigger for the whole flow.
+async function handlePotwImageSubmission(message) {
+  const image = message.attachments.find(a => a.contentType && a.contentType.startsWith('image/'));
+  if (!image) return;
+
+  const key = `${++potwSubmissionCounter}`;
+  pendingPotwSubmissions.set(key, { imageUrl: image.url, submitterId: message.author.id, category: null, period: null, adDay: null, rows: [] });
+
+  await message.reply(buildPotwCategoryButtons(key));
 }
 
 // Builds a ping string for one or more role IDs, plus the optional extra
@@ -1555,6 +1773,22 @@ async function handleReminderHelpCommand(message) {
   await message.reply({ embeds: [embed] });
 }
 
+// "!help potw" - explains the Players of the Week flow. No command syntax to
+// document since posting an image in the configured channel is the trigger.
+async function handlePotwHelpCommand(message) {
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 Players of the Week')
+    .setDescription(
+      `Post a leaderboard screenshot in the Players of the Week channel - no command needed, ` +
+      `just attach the image.\n\n` +
+      `I'll ask which leaderboard it is (Alliance Duel or Donations), then which day or whether ` +
+      `it's the weekly total, then read the top 5 names and scores out of the image and show you ` +
+      `a draft. **Confirm** posts it, **Edit** lets you fix anything I misread, **Cancel** discards it.`
+    )
+    .setColor(0xf6ad55);
+  await message.reply({ embeds: [embed] });
+}
+
 // Called once at startup - searches recent messages in the storage channel
 // for our own MASTER:/REMAINING: messages and restores state from them. If
 // none exist yet (first ever run), keeps the hardcoded defaults and creates
@@ -2329,7 +2563,7 @@ async function handleGiftFeedMessage(message) {
 // approval buttons (Approve as Member / Approve as Allied Wolf / Deny).
 // ---------------------------------------------------------------------------
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
+  if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
 
   try {
     if (interaction.isStringSelectMenu()) {
@@ -2386,7 +2620,136 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
+      const adPeriodMatch = interaction.customId.match(/^potw_adperiod_(\d+)$/);
+      if (adPeriodMatch) {
+        const key = adPeriodMatch[1];
+        const pending = pendingPotwSubmissions.get(key);
+        if (!pending) {
+          await interaction.update({ content: 'This submission has expired - please post the screenshot again.', components: [] });
+          return;
+        }
+        const value = interaction.values[0];
+        if (value === 'weekly') {
+          pending.period = 'weekly';
+          pending.adDay = null;
+        } else {
+          pending.period = 'daily';
+          pending.adDay = parseInt(value, 10);
+        }
+        await runPotwExtractionAndShowDraft(interaction, key);
+        return;
+      }
+
       return; // unrecognized select menu - ignore
+    }
+
+    if (interaction.isModalSubmit()) {
+      const editMatch = interaction.customId.match(/^potw_editmodal_(\d+)$/);
+      if (editMatch) {
+        const key = editMatch[1];
+        const pending = pendingPotwSubmissions.get(key);
+        if (!pending) {
+          await interaction.reply({ content: 'This submission has expired - please post the screenshot again.', ephemeral: true });
+          return;
+        }
+        const raw = interaction.fields.getTextInputValue('potw_editinput');
+        // Expected format per line: "1. Name - Score" (rank prefix optional/ignored - re-numbered by line order)
+        const rows = raw
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean)
+          .map(line => line.replace(/^\d+\.\s*/, ''))
+          .map(line => {
+            const idx = line.lastIndexOf('-');
+            if (idx === -1) return null;
+            const name = line.slice(0, idx).trim();
+            const score = line.slice(idx + 1).trim();
+            if (!name || !score) return null;
+            return { name, score };
+          })
+          .filter(Boolean)
+          .slice(0, 5)
+          .map((r, i) => ({ rank: i + 1, name: r.name, score: r.score }));
+
+        pending.rows = rows;
+        const embed = buildPotwEmbed(pending).setFooter({ text: '📝 Draft - check this looks right before confirming' });
+        await interaction.update({ content: null, embeds: [embed], components: buildPotwDraftComponents(key) });
+        return;
+      }
+      return;
+    }
+
+    const potwCatMatch = interaction.customId.match(/^potw_cat_(ad|don)_(\d+)$/);
+    if (potwCatMatch) {
+      const [, cat, key] = potwCatMatch;
+      const pending = pendingPotwSubmissions.get(key);
+      if (!pending) {
+        await interaction.update({ content: 'This submission has expired - please post the screenshot again.', components: [] });
+        return;
+      }
+      pending.category = cat;
+      if (cat === 'ad') {
+        await interaction.update(buildPotwAdDaySelect(key));
+      } else {
+        await interaction.update(buildPotwDonationPeriodButtons(key));
+      }
+      return;
+    }
+
+    const potwDonPeriodMatch = interaction.customId.match(/^potw_donperiod_(daily|weekly)_(\d+)$/);
+    if (potwDonPeriodMatch) {
+      const [, period, key] = potwDonPeriodMatch;
+      const pending = pendingPotwSubmissions.get(key);
+      if (!pending) {
+        await interaction.update({ content: 'This submission has expired - please post the screenshot again.', components: [] });
+        return;
+      }
+      pending.period = period;
+      await runPotwExtractionAndShowDraft(interaction, key);
+      return;
+    }
+
+    if (interaction.customId.startsWith('potw_edit_')) {
+      const key = interaction.customId.slice('potw_edit_'.length);
+      const pending = pendingPotwSubmissions.get(key);
+      if (!pending) {
+        await interaction.reply({ content: 'This submission has expired - please post the screenshot again.', ephemeral: true });
+        return;
+      }
+      const prefill = pending.rows.length
+        ? pending.rows.map(r => `${r.rank}. ${r.name} - ${r.score}`).join('\n')
+        : '1. Name - Score';
+      const modal = new ModalBuilder().setCustomId(`potw_editmodal_${key}`).setTitle('Edit Players of the Week');
+      const input = new TextInputBuilder()
+        .setCustomId('potw_editinput')
+        .setLabel('One per line: "1. Name - Score"')
+        .setStyle(TextInputStyle.Paragraph)
+        .setValue(prefill)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    const potwDecisionMatch = interaction.customId.match(/^potw_(confirm|cancel)_(\d+)$/);
+    if (potwDecisionMatch) {
+      const [, decision, key] = potwDecisionMatch;
+      const pending = pendingPotwSubmissions.get(key);
+      if (!pending) {
+        await interaction.update({ content: 'This submission has already been handled or expired.', components: [] });
+        return;
+      }
+
+      pendingPotwSubmissions.delete(key);
+
+      if (decision === 'cancel') {
+        await interaction.update({ content: 'Cancelled - nothing was posted.', embeds: [], components: [] });
+        return;
+      }
+
+      const embed = buildPotwEmbed(pending);
+      await interaction.update({ content: null, embeds: [embed], components: [] });
+      return;
     }
 
     if (interaction.customId === 'reminder_type_shield') {
@@ -2648,6 +3011,15 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  if (!message.author.bot && POTW_SUBMIT_CHANNEL_ID && message.channel.id === POTW_SUBMIT_CHANNEL_ID && message.attachments.size) {
+    try {
+      await handlePotwImageSubmission(message);
+    } catch (err) {
+      console.error('Error starting Players of the Week submission:', err.message);
+    }
+    return;
+  }
+
   if (message.author.bot) return;
   const content = message.content.toLowerCase();
   try {
@@ -2673,6 +3045,8 @@ client.on('messageCreate', async (message) => {
       await handleBirthdayHelpCommand(message);
     } else if (content.startsWith('!help reminder')) {
       await handleReminderHelpCommand(message);
+    } else if (content.startsWith('!help potw')) {
+      await handlePotwHelpCommand(message);
     } else if (content.startsWith('!help')) {
       await handleCaravanHelpCommand(message);
     } else if (content.startsWith('!vip')) {
