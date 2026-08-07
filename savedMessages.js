@@ -48,6 +48,14 @@ let storageMessages = []; // chunked storage message refs, same pattern as birth
 const pendingImageWait = new Map();
 const IMAGE_WAIT_MS = 2 * 60 * 1000;
 
+// How long to leave the image-fulfillment exchange (the member's image post
+// and the bot's "Image attached" confirmation) visible before cleaning it
+// up, so the channel doesn't accumulate that back-and-forth over time.
+const AUTO_DELETE_MS = 5 * 60 * 1000;
+function scheduleDelete(message) {
+  setTimeout(() => message.delete().catch(() => {}), AUTO_DELETE_MS);
+}
+
 // userId -> array of interactions whose ephemeral reply is still live for
 // that user (the main menu flow, plus any "Update Image" instruction
 // replies) - cleared out the next time they click Messages, so re-starting
@@ -75,23 +83,13 @@ function buildStartButtonRow() {
   );
 }
 
-// ensureStickyButton (startup / after the button itself was deleted) and
-// bumpStickyButton (move it to the bottom after new channel activity) both
-// mutate stickyMessageId and the channel. Running two of these concurrently
-// raced: each read a stale stickyMessageId, so both could conclude "it's
-// gone" and post their own replacement, producing the duplicate "Click
-// below..." messages and visual flicker seen in production. runStickyOp
-// serializes every call through one lock, and coalesces any bump requests
-// that arrive while one is already in flight into a single follow-up bump
-// rather than one per message.
+// ensureStickyButton can be triggered from several places (startup,
+// messageDelete, messageDeleteBulk) in quick succession - this lock keeps
+// two of those from running concurrently and racing on stickyMessageId.
 let stickyBusy = false;
-let stickyBumpQueued = false;
 
 async function runStickyOp(client, fn) {
-  if (stickyBusy) {
-    if (fn === bumpStickyButton) stickyBumpQueued = true;
-    return;
-  }
+  if (stickyBusy) return;
   stickyBusy = true;
   try {
     await fn(client);
@@ -99,12 +97,13 @@ async function runStickyOp(client, fn) {
     console.error('Saved Messages: sticky button operation failed:', err.message);
   }
   stickyBusy = false;
-  if (stickyBumpQueued) {
-    stickyBumpQueued = false;
-    await runStickyOp(client, bumpStickyButton);
-  }
 }
 
+// Pinned rather than kept-at-the-bottom-via-repost (the earlier approach) -
+// deleting and reposting the button every time the channel got busy caused
+// visible flicker no matter how it was debounced. Pinning is Discord's
+// native answer to "keep this reachable regardless of chat activity": zero
+// flicker, always one click away via the channel's pin icon.
 async function ensureStickyButton(client) {
   if (!SAVED_MESSAGES_CHANNEL_ID) return;
   try {
@@ -113,7 +112,10 @@ async function ensureStickyButton(client) {
 
     if (stickyMessageId) {
       const stillThere = await channel.messages.fetch(stickyMessageId).catch(() => null);
-      if (stillThere) return;
+      if (stillThere) {
+        if (!stillThere.pinned) await stillThere.pin().catch(err => console.error('Saved Messages: failed to pin sticky button:', err.message));
+        return;
+      }
       stickyMessageId = null;
     } else {
       // Pages back through up to 500 messages rather than just the most
@@ -127,6 +129,7 @@ async function ensureStickyButton(client) {
         const existing = batch.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.customId === 'sm_start');
         if (existing) {
           stickyMessageId = existing.id;
+          if (!existing.pinned) await existing.pin().catch(err => console.error('Saved Messages: failed to pin sticky button:', err.message));
           return;
         }
         if (batch.size < 100) break;
@@ -136,44 +139,10 @@ async function ensureStickyButton(client) {
 
     const sent = await channel.send({ content: 'Click below to save a message or look one up.', components: [buildStartButtonRow()] });
     stickyMessageId = sent.id;
+    await sent.pin().catch(err => console.error('Saved Messages: failed to pin sticky button:', err.message));
   } catch (err) {
     console.error('Saved Messages: failed to ensure sticky button:', err.message);
   }
-}
-
-// Deletion alone (handled by ensureStickyButton via the messageDelete
-// listener) only covers the button being removed - it doesn't stop new
-// channel activity from pushing it up out of view. This re-posts it as the
-// newest message whenever anything else appears in the channel, so it's
-// always the last thing in the channel rather than something to scroll for.
-// Only ever called through runStickyOp - never directly.
-async function bumpStickyButton(client) {
-  if (!SAVED_MESSAGES_CHANNEL_ID) return;
-  const channel = await client.channels.fetch(SAVED_MESSAGES_CHANNEL_ID);
-  if (!channel) return;
-
-  const oldId = stickyMessageId;
-  stickyMessageId = null; // clear first so the messageDelete listener treats this as expected, not a stray deletion to react to
-  if (oldId) {
-    const old = await channel.messages.fetch(oldId).catch(() => null);
-    if (old) await old.delete().catch(() => {});
-  }
-  const sent = await channel.send({ content: 'Click below to save a message or look one up.', components: [buildStartButtonRow()] });
-  stickyMessageId = sent.id;
-}
-
-// Waits for a short quiet period after the last message before bumping, so
-// a burst of activity (several messages in a row) settles into a single
-// move instead of the button flickering once per message.
-const BUMP_DEBOUNCE_MS = 2000;
-let bumpDebounceTimer = null;
-
-function scheduleBump(client) {
-  if (bumpDebounceTimer) clearTimeout(bumpDebounceTimer);
-  bumpDebounceTimer = setTimeout(() => {
-    bumpDebounceTimer = null;
-    runStickyOp(client, bumpStickyButton);
-  }, BUMP_DEBOUNCE_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,18 +408,12 @@ function registerSavedMessagesImpl(client) {
           if (record) {
             record.imageUrl = image.url;
             await saveSavedMessagesToDiscord(client);
-            await message.reply(`Image attached to "${record.title}"!`);
+            const reply = await message.reply(`Image attached to "${record.title}"!`);
+            scheduleDelete(message);
+            scheduleDelete(reply);
           }
         }
       }
-    }
-
-    // Keep the sticky button as the last message in the channel, regardless
-    // of who (or what) just posted - otherwise it just sits wherever it was
-    // and gets buried under normal channel activity. Debounced so a burst
-    // of messages settles into one move instead of flickering per message.
-    if (message.id !== stickyMessageId) {
-      scheduleBump(client);
     }
   });
 
