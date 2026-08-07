@@ -166,8 +166,24 @@ function buildTeleportToggleButtons(key) {
   return { content: 'Include a reminder to teleport into position first?', embeds: [], components: [row] };
 }
 
-function buildNoteModal(key, step) {
-  const modal = new ModalBuilder().setCustomId(`mb_notemodal_${key}`).setTitle(step.modalTitle || 'Add a note');
+// Every step shows a header naming the event, the angle, and - when a step
+// carries a `subject` (e.g. Elixir Scramble's per-group day/time pairs once
+// "Both Teams" is picked) - which one it's currently collecting for. Without
+// this, a leader mid-flow has no way to tell which of two identical-looking
+// "Pick a day" prompts they're answering.
+function stepContextLabel(pending, step) {
+  const ev = EVENTS[pending.eventKey];
+  const angle = ev.angles[pending.angleKey];
+  let label = `${ev.label} — ${angle.label}`;
+  const subject = (step && step.subject) || pending.groupSubject;
+  if (subject) label += ` (${subject})`;
+  return label;
+}
+
+function buildNoteModal(pending, step) {
+  const key = pending.key;
+  const title = `${stepContextLabel(pending, step)}`.slice(0, 45); // Discord modal titles cap at 45 chars
+  const modal = new ModalBuilder().setCustomId(`mb_notemodal_${key}`).setTitle(title);
   const input = new TextInputBuilder()
     .setCustomId('mb_noteinput')
     .setLabel(step.label || 'Note (optional)')
@@ -177,8 +193,10 @@ function buildNoteModal(key, step) {
   return modal;
 }
 
-function buildFreeTimeModal(key) {
-  const modal = new ModalBuilder().setCustomId(`mb_othertimemodal_${key}`).setTitle('Custom time');
+function buildFreeTimeModal(pending, step) {
+  const key = pending.key;
+  const title = `${stepContextLabel(pending, step)}`.slice(0, 45);
+  const modal = new ModalBuilder().setCustomId(`mb_othertimemodal_${key}`).setTitle(title);
   const input = new TextInputBuilder()
     .setCustomId('mb_timeinput')
     .setLabel('Time (e.g. "14:30 server time")')
@@ -191,15 +209,18 @@ function buildFreeTimeModal(key) {
 function renderStepComponents(pending) {
   const step = pending.steps[pending.stepIndex];
   const key = pending.key;
+  let result;
   switch (step.type) {
-    case 'day': return buildDaySelect(key);
-    case 'time': return buildTimeSelect(key);
-    case 'groupSingle': return buildGroupSingleSelect(key);
-    case 'groupMulti': return buildGroupMultiChoiceButtons(key);
-    case 'toggleCancelReschedule': return buildCancelRescheduleButtons(key);
-    case 'teleportToggle': return buildTeleportToggleButtons(key);
+    case 'day': result = buildDaySelect(key); break;
+    case 'time': result = buildTimeSelect(key); break;
+    case 'groupSingle': result = buildGroupSingleSelect(key); break;
+    case 'groupMulti': result = buildGroupMultiChoiceButtons(key); break;
+    case 'toggleCancelReschedule': result = buildCancelRescheduleButtons(key); break;
+    case 'teleportToggle': result = buildTeleportToggleButtons(key); break;
     default: return null; // modalNote is shown via showModal, not rendered as an update
   }
+  result.content = `**${stepContextLabel(pending, step)}**\n${result.content}`;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +478,7 @@ function beginAngle(pending, eventKey, angleKey) {
   pending.steps = angle.steps.map(s => ({ ...s })); // per-build copy - steps get spliced dynamically
   pending.stepIndex = 0;
   pending.collected = {};
+  pending.groupSubject = null;
 }
 
 async function renderCurrentStepOrDeliver(interaction, key) {
@@ -471,7 +493,7 @@ async function renderCurrentStepOrDeliver(interaction, key) {
   }
   const step = pending.steps[pending.stepIndex];
   if (step.type === 'modalNote') {
-    await interaction.showModal(buildNoteModal(key, step));
+    await interaction.showModal(buildNoteModal(pending, step));
     return;
   }
   await interaction.update(renderStepComponents(pending));
@@ -587,7 +609,7 @@ function registerMessageBuilderImpl(client) {
         if (step.type === 'time') {
           const v = interaction.values[0];
           if (v === 'other') {
-            await interaction.showModal(buildFreeTimeModal(key));
+            await interaction.showModal(buildFreeTimeModal(pending, step));
             return;
           }
           pending.collected[step.key] = v === 'skip' ? null : formatTimeValue(Number(v));
@@ -598,6 +620,10 @@ function registerMessageBuilderImpl(client) {
 
         if (step.type === 'groupSingle') {
           pending.collected[step.key] = interaction.values[0];
+          // Applies to the whole rest of this flow (e.g. the toggle and
+          // reason/reschedule steps that follow) - stepContextLabel falls
+          // back to this whenever a step doesn't set its own `subject`.
+          pending.groupSubject = `Team ${interaction.values[0]}`;
           pending.stepIndex++;
           await renderCurrentStepOrDeliver(interaction, key);
           return;
@@ -622,7 +648,12 @@ function registerMessageBuilderImpl(client) {
           const groups = choice === 'both' ? ['A', 'B'] : [choice];
           pending.collected[step.key] = groups;
           const newSteps = [];
-          for (const g of groups) newSteps.push({ type: 'day', key: `day_${g}` }, { type: 'time', key: `time_${g}` });
+          for (const g of groups) {
+            newSteps.push(
+              { type: 'day', key: `day_${g}`, subject: `Team ${g}` },
+              { type: 'time', key: `time_${g}`, subject: `Team ${g}` }
+            );
+          }
           pending.steps.splice(pending.stepIndex + 1, 0, ...newSteps);
           pending.stepIndex++;
           await renderCurrentStepOrDeliver(interaction, key);
