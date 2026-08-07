@@ -4,7 +4,6 @@ const cron = require('node-cron');
 const http = require('http');
 const { Jimp } = require('jimp');
 const { createWorker } = require('tesseract.js');
-const { registerMessageBuilder } = require('./messageBuilder');
 
 // Minimal health-check server. This bot has no web interface of its own, but
 // some hosts (Railway included, depending on how the service is configured)
@@ -24,11 +23,6 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // needed so message.member.roles is reliably populated for the !cheese leader check - must also be enabled in the Developer Portal
   ],
 });
-
-// Message Builder lives in its own file (messageBuilder.js) with its own
-// self-contained listeners - self-checks its channel/customId prefix, so
-// this is safe to register alongside everything else below.
-registerMessageBuilder(client);
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;
