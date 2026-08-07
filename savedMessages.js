@@ -92,6 +92,26 @@ async function ensureStickyButton(client) {
   }
 }
 
+// Deletion alone (handled by ensureStickyButton via the messageDelete
+// listener) only covers the button being removed - it doesn't stop new
+// channel activity from pushing it up out of view. This re-posts it as the
+// newest message whenever anything else appears in the channel, so it's
+// always the last thing in the channel rather than something to scroll for.
+async function bumpStickyButton(client, channel) {
+  const oldId = stickyMessageId;
+  stickyMessageId = null; // clear first so the messageDelete listener treats this as expected, not a stray deletion to react to
+  if (oldId) {
+    const old = await channel.messages.fetch(oldId).catch(() => null);
+    if (old) await old.delete().catch(() => {});
+  }
+  try {
+    const sent = await channel.send({ content: 'Click below to save a message or look one up.', components: [buildStartButtonRow()] });
+    stickyMessageId = sent.id;
+  } catch (err) {
+    console.error('Saved Messages: failed to bump sticky button:', err.message);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Persistence - same chunked-Discord-message pattern as birthdays/reminders
 // in index.js, but chunking a raw JSON string by length rather than joining
@@ -336,23 +356,31 @@ function registerSavedMessagesImpl(client) {
   // Fulfils a pending "waiting for an image" window - from either a fresh
   // save or an "Update Image" click on an existing message.
   client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
     if (!SAVED_MESSAGES_CHANNEL_ID || message.channel.id !== SAVED_MESSAGES_CHANNEL_ID) return;
-    const wait = pendingImageWait.get(message.author.id);
-    if (!wait) return;
-    const image = message.attachments.find(a => a.contentType && a.contentType.startsWith('image/'));
-    if (!image) return;
 
-    const records = SAVED_MESSAGES[message.author.id] || [];
-    const record = records.find(r => r.id === wait.messageId);
-    if (!record) {
-      pendingImageWait.delete(message.author.id);
-      return;
+    if (!message.author.bot) {
+      const wait = pendingImageWait.get(message.author.id);
+      if (wait) {
+        const image = message.attachments.find(a => a.contentType && a.contentType.startsWith('image/'));
+        if (image) {
+          const records = SAVED_MESSAGES[message.author.id] || [];
+          const record = records.find(r => r.id === wait.messageId);
+          pendingImageWait.delete(message.author.id);
+          if (record) {
+            record.imageUrl = image.url;
+            await saveSavedMessagesToDiscord(client);
+            await message.reply(`Image attached to "${record.title}"!`);
+          }
+        }
+      }
     }
-    record.imageUrl = image.url;
-    pendingImageWait.delete(message.author.id);
-    await saveSavedMessagesToDiscord(client);
-    await message.reply(`Image attached to "${record.title}"!`);
+
+    // Keep the sticky button as the last message in the channel, regardless
+    // of who (or what) just posted - otherwise it just sits wherever it was
+    // and gets buried under normal channel activity.
+    if (message.id !== stickyMessageId) {
+      await bumpStickyButton(client, message.channel);
+    }
   });
 
   function armImageWait(userId, messageId) {
