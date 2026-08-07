@@ -31,7 +31,12 @@ const {
 } = require('discord.js');
 
 const SAVED_MESSAGES_CHANNEL_ID = process.env.SAVED_MESSAGES_CHANNEL_ID;
-const STORAGE_CHANNEL_ID = process.env.VIP_STORAGE_CHANNEL_ID; // reuses the bot's existing storage channel
+// Its own dedicated storage channel rather than reusing VIP_STORAGE_CHANNEL_ID -
+// that channel already caused a real data-loss bug earlier from too much
+// traffic pushing older chunk messages past the fetch window; keeping this
+// feature's (potentially large, growing) storage separate avoids adding to
+// that pressure.
+const STORAGE_CHANNEL_ID = process.env.SAVED_MESSAGES_STORAGE_CHANNEL_ID;
 
 // userId -> [{ id, category, title, text, imageUrl }]
 let SAVED_MESSAGES = {};
