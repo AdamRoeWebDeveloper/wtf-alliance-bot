@@ -1,13 +1,15 @@
 // ---------------------------------------------------------------------------
 // DISCORD MESSAGE BUILDER
-// Self-contained module (its own messageCreate/interactionCreate listeners,
-// own customId namespace `mb_*`) - registered from index.js via
-// registerMessageBuilder(client). Walks a leader through Event -> Angle ->
-// a short sequence of inputs (Day/Time/groups/etc, all funneled through a
-// generic step-runner) and DMs them the finished, ready-to-paste message.
+// Self-contained module (its own event listeners, own customId namespace
+// `mb_*`) - registered from index.js via registerMessageBuilder(client).
+// Keeps a permanent "Start Message" button present in MESSAGE_BUILDER_CHANNEL_ID
+// (re-posted on startup and immediately re-posted if it's ever deleted).
+// Clicking it walks a leader through Event -> Angle -> a short sequence of
+// inputs (Day/Time/groups/etc, all funneled through a generic step-runner)
+// and DMs them the finished, ready-to-paste message.
 //
-// Only listens in MESSAGE_BUILDER_CHANNEL_ID - everywhere else, and any
-// message in that channel without the trigger, is ignored.
+// Everything here is scoped to MESSAGE_BUILDER_CHANNEL_ID - interactions
+// from any other channel are ignored.
 // ---------------------------------------------------------------------------
 const {
   ActionRowBuilder,
@@ -25,6 +27,44 @@ const MESSAGE_BUILDER_CHANNEL_ID = process.env.MESSAGE_BUILDER_CHANNEL_ID;
 // same pattern as pendingVipActions/pendingPotwSubmissions in index.js.
 const pendingBuilds = new Map(); // key -> { key, userId, eventKey, angleKey, steps, stepIndex, collected }
 let buildCounter = 0;
+
+// The "Start Message" button is kept permanently present in the channel
+// rather than typed on demand - re-posted on startup (if missing) and
+// immediately re-posted if it's ever deleted (single or bulk delete).
+let stickyMessageId = null;
+
+function buildStartButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mb_start').setLabel('Start Message').setStyle(ButtonStyle.Primary)
+  );
+}
+
+async function ensureStickyButton(client) {
+  if (!MESSAGE_BUILDER_CHANNEL_ID) return;
+  try {
+    const channel = await client.channels.fetch(MESSAGE_BUILDER_CHANNEL_ID);
+    if (!channel) return;
+
+    if (stickyMessageId) {
+      const stillThere = await channel.messages.fetch(stickyMessageId).catch(() => null);
+      if (stillThere) return;
+      stickyMessageId = null;
+    } else {
+      // Covers a restart: reuse an existing button rather than posting a duplicate.
+      const recent = await channel.messages.fetch({ limit: 50 });
+      const existing = recent.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.customId === 'mb_start');
+      if (existing) {
+        stickyMessageId = existing.id;
+        return;
+      }
+    }
+
+    const sent = await channel.send({ content: 'Click below to build a ready-to-paste message for an event.', components: [buildStartButtonRow()] });
+    stickyMessageId = sent.id;
+  } catch (err) {
+    console.error('Message Builder: failed to ensure sticky button:', err.message);
+  }
+}
 
 const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 // Reuses the bot's established 4-hourly server-time cadence (index.js
@@ -420,7 +460,7 @@ function beginAngle(pending, eventKey, angleKey) {
 async function renderCurrentStepOrDeliver(interaction, key) {
   const pending = pendingBuilds.get(key);
   if (!pending) {
-    await interaction.update({ content: 'This build has expired - please run `!message` again.', embeds: [], components: [] }).catch(() => {});
+    await interaction.update({ content: 'This build has expired - please click Start Message again.', embeds: [], components: [] }).catch(() => {});
     return;
   }
   if (pending.stepIndex >= pending.steps.length) {
@@ -457,15 +497,22 @@ async function deliverBuiltMessage(interaction, pending) {
 // registerMessageBuilder(client) - self-contained listeners.
 // ---------------------------------------------------------------------------
 function registerMessageBuilderImpl(client) {
-  client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
-    if (!MESSAGE_BUILDER_CHANNEL_ID || message.channel.id !== MESSAGE_BUILDER_CHANNEL_ID) return;
-    if (!message.content.toLowerCase().startsWith('!message')) return;
+  client.once('ready', () => ensureStickyButton(client));
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('mb_start').setLabel('Message').setStyle(ButtonStyle.Primary)
-    );
-    await message.reply({ content: 'Click below to build a ready-to-paste message for an event.', components: [row] });
+  client.on('messageDelete', async (message) => {
+    if (!MESSAGE_BUILDER_CHANNEL_ID || message.channelId !== MESSAGE_BUILDER_CHANNEL_ID) return;
+    if (message.id !== stickyMessageId) return;
+    stickyMessageId = null;
+    await ensureStickyButton(client);
+  });
+
+  client.on('messageDeleteBulk', async (messages) => {
+    if (!MESSAGE_BUILDER_CHANNEL_ID) return;
+    const first = messages.first();
+    if (!first || first.channelId !== MESSAGE_BUILDER_CHANNEL_ID) return;
+    if (!messages.has(stickyMessageId)) return;
+    stickyMessageId = null;
+    await ensureStickyButton(client);
   });
 
   client.on('interactionCreate', async (interaction) => {
@@ -487,7 +534,7 @@ function registerMessageBuilderImpl(client) {
         const key = eventMatch[1];
         const pending = pendingBuilds.get(key);
         if (!pending) {
-          await interaction.update({ content: 'This build has expired - please run `!message` again.', embeds: [], components: [] });
+          await interaction.update({ content: 'This build has expired - please click Start Message again.', embeds: [], components: [] });
           return;
         }
         const eventKey = interaction.values[0];
@@ -508,7 +555,7 @@ function registerMessageBuilderImpl(client) {
         const key = angleMatch[1];
         const pending = pendingBuilds.get(key);
         if (!pending) {
-          await interaction.update({ content: 'This build has expired - please run `!message` again.', embeds: [], components: [] });
+          await interaction.update({ content: 'This build has expired - please click Start Message again.', embeds: [], components: [] });
           return;
         }
         beginAngle(pending, pending.eventKey, interaction.values[0]);
@@ -522,7 +569,7 @@ function registerMessageBuilderImpl(client) {
         const key = stepSelectMatch[1];
         const pending = pendingBuilds.get(key);
         if (!pending) {
-          await interaction.update({ content: 'This build has expired - please run `!message` again.', embeds: [], components: [] });
+          await interaction.update({ content: 'This build has expired - please click Start Message again.', embeds: [], components: [] });
           return;
         }
         const step = pending.steps[pending.stepIndex];
@@ -575,7 +622,7 @@ function registerMessageBuilderImpl(client) {
         const [, key, choice] = stepButtonMatch;
         const pending = pendingBuilds.get(key);
         if (!pending) {
-          await interaction.update({ content: 'This build has expired - please run `!message` again.', embeds: [], components: [] });
+          await interaction.update({ content: 'This build has expired - please click Start Message again.', embeds: [], components: [] });
           return;
         }
         const step = pending.steps[pending.stepIndex];
@@ -608,7 +655,7 @@ function registerMessageBuilderImpl(client) {
           const key = noteMatch[1];
           const pending = pendingBuilds.get(key);
           if (!pending) {
-            await interaction.reply({ content: 'This build has expired - please run `!message` again.', ephemeral: true });
+            await interaction.reply({ content: 'This build has expired - please click Start Message again.', ephemeral: true });
             return;
           }
           const step = pending.steps[pending.stepIndex];
@@ -624,7 +671,7 @@ function registerMessageBuilderImpl(client) {
           const key = timeMatch[1];
           const pending = pendingBuilds.get(key);
           if (!pending) {
-            await interaction.reply({ content: 'This build has expired - please run `!message` again.', ephemeral: true });
+            await interaction.reply({ content: 'This build has expired - please click Start Message again.', ephemeral: true });
             return;
           }
           const step = pending.steps[pending.stepIndex];
@@ -637,7 +684,7 @@ function registerMessageBuilderImpl(client) {
       }
     } catch (err) {
       console.error('Message Builder error:', err.message);
-      const errorReply = { content: 'Something went wrong - please run `!message` again.', embeds: [], components: [] };
+      const errorReply = { content: 'Something went wrong - please click Start Message again.', embeds: [], components: [] };
       try {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply(errorReply);
