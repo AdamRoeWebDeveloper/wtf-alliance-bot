@@ -138,14 +138,16 @@ function buildGroupSingleSelect(key) {
   return { content: 'Which group is this for?', embeds: [], components: [new ActionRowBuilder().addComponents(menu)] };
 }
 
-function buildGroupMultiSelect(key) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`mb_step_${key}`)
-    .setPlaceholder('Pick one or both groups')
-    .setMinValues(1)
-    .setMaxValues(2)
-    .addOptions({ label: 'Team A', value: 'A' }, { label: 'Team B', value: 'B' });
-  return { content: 'Which group(s) are registering?', embeds: [], components: [new ActionRowBuilder().addComponents(menu)] };
+// Buttons rather than a multi-select dropdown - "pick one or both from two
+// checkboxes" wasn't a discoverable way to select both, an explicit "Both
+// Teams" button is unambiguous.
+function buildGroupMultiChoiceButtons(key) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`mb_step_${key}_A`).setLabel('Team A').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mb_step_${key}_B`).setLabel('Team B').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mb_step_${key}_both`).setLabel('Both Teams').setStyle(ButtonStyle.Primary)
+  );
+  return { content: 'Which group(s) are registering?', embeds: [], components: [row] };
 }
 
 function buildCancelRescheduleButtons(key) {
@@ -193,7 +195,7 @@ function renderStepComponents(pending) {
     case 'day': return buildDaySelect(key);
     case 'time': return buildTimeSelect(key);
     case 'groupSingle': return buildGroupSingleSelect(key);
-    case 'groupMulti': return buildGroupMultiSelect(key);
+    case 'groupMulti': return buildGroupMultiChoiceButtons(key);
     case 'toggleCancelReschedule': return buildCancelRescheduleButtons(key);
     case 'teleportToggle': return buildTeleportToggleButtons(key);
     default: return null; // modalNote is shown via showModal, not rendered as an update
@@ -216,22 +218,22 @@ const EVENTS = {
           if (c.groups.length === 1) {
             const g = c.groups[0];
             const schedule = scheduleClause(c[`day_${g}`], c[`time_${g}`]);
-            return `Hey WTF fam! Team ${g} registration is now open, jump in! ${g} kicks off ${schedule}, so grab your spot early and get your squad ready. Looking forward to seeing you all out there!`;
+            return `Hey WTF fam! Elixir Scramble Team ${g} registration is now open, jump in! Team ${g} kicks off ${schedule}, so grab your spot early and get your squad ready. Looking forward to seeing you all out there!`;
           }
           const schedA = scheduleClause(c.day_A, c.time_A);
           const schedB = scheduleClause(c.day_B, c.time_B);
-          return `Hey WTF fam! Registration for both Team A and Team B is now open, let's go! A kicks off ${schedA}, and B follows ${schedB}. Grab your spot early and get your squad ready, looking forward to seeing you all out there!`;
+          return `Hey WTF fam! Registration for Elixir Scramble is now open for both Team A and Team B, let's go! Team A kicks off ${schedA}, and Team B follows ${schedB}. Grab your spot early and get your squad ready, looking forward to seeing you all out there!`;
         },
       },
       reminder: {
         label: 'Reminder',
         steps: [{ type: 'groupSingle', key: 'group' }, { type: 'day', key: 'day' }, { type: 'time', key: 'time' }],
-        template: (c) => `Just a friendly heads up, Team ${c.group} kicks off ${scheduleClause(c.day, c.time)}. Get your squad prepped and ready to go, we'd love to have you there. Don't miss it!`,
+        template: (c) => `Just a friendly heads up, Elixir Scramble Team ${c.group} kicks off ${scheduleClause(c.day, c.time)}. Get your squad prepped and ready to go, we'd love to have you there. Don't miss it!`,
       },
       cancelledRescheduled: {
         label: 'Cancelled / Rescheduled',
         steps: [{ type: 'groupSingle', key: 'group' }, { type: 'toggleCancelReschedule' }],
-        template: (c) => cancelledRescheduledTemplate(`Team ${c.group}`, c),
+        template: (c) => cancelledRescheduledTemplate(`Elixir Scramble Team ${c.group}`, c),
       },
     },
   },
@@ -392,7 +394,7 @@ const EVENTS = {
         label: 'Reminder',
         steps: [{ type: 'day', key: 'day' }, { type: 'time', key: 'time' }, { type: 'teleportToggle' }],
         template: (c) => {
-          let msg = `Reminder, Royal City rally starts ${scheduleClause(c.day, c.time)}. Get your marches ready, we want everyone in position together. Thanks for being part of the push!`;
+          let msg = `Reminder, Kingdom War's Royal City rally starts ${scheduleClause(c.day, c.time)}. Get your marches ready, we want everyone in position together. Thanks for being part of the push!`;
           if (c.teleportReminder) msg += " Make sure you're teleported into position before the rally time!";
           return msg;
         },
@@ -563,7 +565,7 @@ function registerMessageBuilderImpl(client) {
         return;
       }
 
-      // Select-menu steps: day / time / groupSingle / groupMulti share one customId shape.
+      // Select-menu steps: day / time / groupSingle share one customId shape.
       const stepSelectMatch = id.match(/^mb_step_(\d+)$/);
       if (stepSelectMatch) {
         const key = stepSelectMatch[1];
@@ -601,17 +603,6 @@ function registerMessageBuilderImpl(client) {
           return;
         }
 
-        if (step.type === 'groupMulti') {
-          const groups = interaction.values;
-          pending.collected[step.key] = groups;
-          const newSteps = [];
-          for (const g of groups) newSteps.push({ type: 'day', key: `day_${g}` }, { type: 'time', key: `time_${g}` });
-          pending.steps.splice(pending.stepIndex + 1, 0, ...newSteps);
-          pending.stepIndex++;
-          await renderCurrentStepOrDeliver(interaction, key);
-          return;
-        }
-
         return;
       }
 
@@ -626,6 +617,17 @@ function registerMessageBuilderImpl(client) {
           return;
         }
         const step = pending.steps[pending.stepIndex];
+
+        if (step.type === 'groupMulti') {
+          const groups = choice === 'both' ? ['A', 'B'] : [choice];
+          pending.collected[step.key] = groups;
+          const newSteps = [];
+          for (const g of groups) newSteps.push({ type: 'day', key: `day_${g}` }, { type: 'time', key: `time_${g}` });
+          pending.steps.splice(pending.stepIndex + 1, 0, ...newSteps);
+          pending.stepIndex++;
+          await renderCurrentStepOrDeliver(interaction, key);
+          return;
+        }
 
         if (step.type === 'toggleCancelReschedule') {
           pending.collected.decision = choice;
