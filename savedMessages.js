@@ -62,11 +62,21 @@ async function ensureStickyButton(client) {
       if (stillThere) return;
       stickyMessageId = null;
     } else {
-      const recent = await channel.messages.fetch({ limit: 50 });
-      const existing = recent.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.customId === 'sm_start');
-      if (existing) {
-        stickyMessageId = existing.id;
-        return;
+      // Pages back through up to 500 messages rather than just the most
+      // recent 50, same fix applied to the VIP/birthday loader in index.js -
+      // avoids ever concluding "no button exists" just because it scrolled
+      // past a small window, which would spawn an unnecessary duplicate.
+      let before;
+      for (let page = 0; page < 5 && !stickyMessageId; page++) {
+        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (!batch.size) break;
+        const existing = batch.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.customId === 'sm_start');
+        if (existing) {
+          stickyMessageId = existing.id;
+          return;
+        }
+        if (batch.size < 100) break;
+        before = batch.last().id;
       }
     }
 
