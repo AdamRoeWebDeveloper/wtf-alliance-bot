@@ -48,12 +48,61 @@ let storageMessages = []; // chunked storage message refs, same pattern as birth
 const pendingImageWait = new Map();
 const IMAGE_WAIT_MS = 2 * 60 * 1000;
 
+// userId -> array of interactions whose ephemeral reply is still live for
+// that user (the main menu flow, plus any "Update Image" instruction
+// replies) - cleared out the next time they click Messages, so re-starting
+// doesn't leave old, possibly stale prompts sitting around.
+const activeFlowReplies = new Map();
+
+function trackReply(userId, interaction) {
+  if (!activeFlowReplies.has(userId)) activeFlowReplies.set(userId, []);
+  activeFlowReplies.get(userId).push(interaction);
+}
+
+async function clearOldReplies(userId) {
+  const prev = activeFlowReplies.get(userId) || [];
+  activeFlowReplies.set(userId, []);
+  for (const oldInteraction of prev) {
+    await oldInteraction.deleteReply().catch(() => {});
+  }
+}
+
 let stickyMessageId = null;
 
 function buildStartButtonRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('sm_start').setLabel('Messages').setStyle(ButtonStyle.Primary)
   );
+}
+
+// ensureStickyButton (startup / after the button itself was deleted) and
+// bumpStickyButton (move it to the bottom after new channel activity) both
+// mutate stickyMessageId and the channel. Running two of these concurrently
+// raced: each read a stale stickyMessageId, so both could conclude "it's
+// gone" and post their own replacement, producing the duplicate "Click
+// below..." messages and visual flicker seen in production. runStickyOp
+// serializes every call through one lock, and coalesces any bump requests
+// that arrive while one is already in flight into a single follow-up bump
+// rather than one per message.
+let stickyBusy = false;
+let stickyBumpQueued = false;
+
+async function runStickyOp(client, fn) {
+  if (stickyBusy) {
+    if (fn === bumpStickyButton) stickyBumpQueued = true;
+    return;
+  }
+  stickyBusy = true;
+  try {
+    await fn(client);
+  } catch (err) {
+    console.error('Saved Messages: sticky button operation failed:', err.message);
+  }
+  stickyBusy = false;
+  if (stickyBumpQueued) {
+    stickyBumpQueued = false;
+    await runStickyOp(client, bumpStickyButton);
+  }
 }
 
 async function ensureStickyButton(client) {
@@ -97,19 +146,34 @@ async function ensureStickyButton(client) {
 // channel activity from pushing it up out of view. This re-posts it as the
 // newest message whenever anything else appears in the channel, so it's
 // always the last thing in the channel rather than something to scroll for.
-async function bumpStickyButton(client, channel) {
+// Only ever called through runStickyOp - never directly.
+async function bumpStickyButton(client) {
+  if (!SAVED_MESSAGES_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(SAVED_MESSAGES_CHANNEL_ID);
+  if (!channel) return;
+
   const oldId = stickyMessageId;
   stickyMessageId = null; // clear first so the messageDelete listener treats this as expected, not a stray deletion to react to
   if (oldId) {
     const old = await channel.messages.fetch(oldId).catch(() => null);
     if (old) await old.delete().catch(() => {});
   }
-  try {
-    const sent = await channel.send({ content: 'Click below to save a message or look one up.', components: [buildStartButtonRow()] });
-    stickyMessageId = sent.id;
-  } catch (err) {
-    console.error('Saved Messages: failed to bump sticky button:', err.message);
-  }
+  const sent = await channel.send({ content: 'Click below to save a message or look one up.', components: [buildStartButtonRow()] });
+  stickyMessageId = sent.id;
+}
+
+// Waits for a short quiet period after the last message before bumping, so
+// a burst of activity (several messages in a row) settles into a single
+// move instead of the button flickering once per message.
+const BUMP_DEBOUNCE_MS = 2000;
+let bumpDebounceTimer = null;
+
+function scheduleBump(client) {
+  if (bumpDebounceTimer) clearTimeout(bumpDebounceTimer);
+  bumpDebounceTimer = setTimeout(() => {
+    bumpDebounceTimer = null;
+    runStickyOp(client, bumpStickyButton);
+  }, BUMP_DEBOUNCE_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -304,9 +368,17 @@ function buildPreviewEmbed(record) {
 function buildManageButtons(record) {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`sm_edittext_${record.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`sm_updateimage_${record.id}`).setLabel('Update Image').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`sm_updateimage_${record.id}`).setLabel('Update Image').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`sm_delete_${record.id}`).setLabel('Delete').setStyle(ButtonStyle.Danger)
   );
   return row;
+}
+
+function buildDeleteConfirmRow(record) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`sm_deleteconfirm_${record.id}`).setLabel('Confirm Delete').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`sm_deletecancel_${record.id}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+  );
 }
 
 async function resolveDisplayName(guild, userId) {
@@ -334,14 +406,13 @@ async function deliverSavedMessage(interaction, record) {
 // ---------------------------------------------------------------------------
 function registerSavedMessagesImpl(client) {
   client.once('ready', () => {
-    loadSavedMessagesFromDiscord(client).then(() => ensureStickyButton(client));
+    loadSavedMessagesFromDiscord(client).then(() => runStickyOp(client, ensureStickyButton));
   });
 
   client.on('messageDelete', async (message) => {
     if (!SAVED_MESSAGES_CHANNEL_ID || message.channelId !== SAVED_MESSAGES_CHANNEL_ID) return;
     if (message.id !== stickyMessageId) return;
-    stickyMessageId = null;
-    await ensureStickyButton(client);
+    await runStickyOp(client, ensureStickyButton);
   });
 
   client.on('messageDeleteBulk', async (messages) => {
@@ -349,8 +420,7 @@ function registerSavedMessagesImpl(client) {
     const first = messages.first();
     if (!first || first.channelId !== SAVED_MESSAGES_CHANNEL_ID) return;
     if (!messages.has(stickyMessageId)) return;
-    stickyMessageId = null;
-    await ensureStickyButton(client);
+    await runStickyOp(client, ensureStickyButton);
   });
 
   // Fulfils a pending "waiting for an image" window - from either a fresh
@@ -377,9 +447,10 @@ function registerSavedMessagesImpl(client) {
 
     // Keep the sticky button as the last message in the channel, regardless
     // of who (or what) just posted - otherwise it just sits wherever it was
-    // and gets buried under normal channel activity.
+    // and gets buried under normal channel activity. Debounced so a burst
+    // of messages settles into one move instead of flickering per message.
     if (message.id !== stickyMessageId) {
-      await bumpStickyButton(client, message.channel);
+      scheduleBump(client);
     }
   });
 
@@ -399,7 +470,9 @@ function registerSavedMessagesImpl(client) {
 
     try {
       if (id === 'sm_start') {
+        await clearOldReplies(interaction.user.id);
         await interaction.reply({ ...buildMenuChoiceButtons(), ephemeral: true });
+        trackReply(interaction.user.id, interaction);
         return;
       }
 
@@ -496,6 +569,46 @@ function registerSavedMessagesImpl(client) {
         }
         armImageWait(interaction.user.id, messageId);
         await interaction.reply({ content: `Post a new image in this channel within 2 minutes to update the image for "${record.title}".`, ephemeral: true });
+        trackReply(interaction.user.id, interaction);
+        return;
+      }
+
+      const deleteMatch = id.match(/^sm_delete_(\d+)$/);
+      if (deleteMatch) {
+        const messageId = Number(deleteMatch[1]);
+        const record = (SAVED_MESSAGES[interaction.user.id] || []).find(r => r.id === messageId);
+        if (!record) {
+          await interaction.update({ content: 'That message no longer exists.', embeds: [], components: [] });
+          return;
+        }
+        await interaction.update({ content: `Delete "${record.title}"? This cannot be undone.`, embeds: [], components: [buildDeleteConfirmRow(record)] });
+        return;
+      }
+
+      const deleteConfirmMatch = id.match(/^sm_deleteconfirm_(\d+)$/);
+      if (deleteConfirmMatch) {
+        const messageId = Number(deleteConfirmMatch[1]);
+        const records = SAVED_MESSAGES[interaction.user.id] || [];
+        const idx = records.findIndex(r => r.id === messageId);
+        if (idx === -1) {
+          await interaction.update({ content: 'That message no longer exists.', embeds: [], components: [] });
+          return;
+        }
+        const [removed] = records.splice(idx, 1);
+        await saveSavedMessagesToDiscord(interaction.client);
+        await interaction.update({ content: `Deleted "${removed.title}".`, embeds: [], components: [] });
+        return;
+      }
+
+      const deleteCancelMatch = id.match(/^sm_deletecancel_(\d+)$/);
+      if (deleteCancelMatch) {
+        const messageId = Number(deleteCancelMatch[1]);
+        const record = (SAVED_MESSAGES[interaction.user.id] || []).find(r => r.id === messageId);
+        if (!record) {
+          await interaction.update({ content: 'That message no longer exists.', embeds: [], components: [] });
+          return;
+        }
+        await interaction.update({ content: null, embeds: [buildPreviewEmbed(record)], components: [buildManageButtons(record)] });
         return;
       }
 
