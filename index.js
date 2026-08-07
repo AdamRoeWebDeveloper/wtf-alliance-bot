@@ -4,6 +4,7 @@ const cron = require('node-cron');
 const http = require('http');
 const { Jimp } = require('jimp');
 const { createWorker } = require('tesseract.js');
+const { registerSavedMessages } = require('./savedMessages');
 
 // Minimal health-check server. This bot has no web interface of its own, but
 // some hosts (Railway included, depending on how the service is configured)
@@ -23,6 +24,11 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // needed so message.member.roles is reliably populated for the !cheese leader check - must also be enabled in the Developer Portal
   ],
 });
+
+// Saved Messages lives in its own file (savedMessages.js) with its own
+// self-contained listeners - self-checks its channel/customId prefix, so
+// this is safe to register alongside everything else below.
+registerSavedMessages(client);
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;
